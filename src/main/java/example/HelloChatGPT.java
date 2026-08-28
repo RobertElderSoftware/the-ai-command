@@ -5,14 +5,30 @@ import com.openai.client.okhttp.OpenAIOkHttpClient;
 import com.openai.models.responses.Response;
 import com.openai.models.responses.ResponseCreateParams;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
@@ -24,16 +40,48 @@ public final class HelloChatGPT {
 
     private static final long SHUTDOWN_TIMEOUT_SECONDS = 30;
 
+    private static final DateTimeFormatter LOG_TS =
+        DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss.SSS")
+            .withZone(ZoneId.systemDefault());
+
+    private static final AtomicInteger LOG_SEQ = new AtomicInteger(1);
+
+    // CIOP constants
+    private static final String CIOP_BEGIN = "---BEGIN CIOP/1.0---";
+    private static final String CIOP_END = "---END CIOP/1.0---";
+    private static final String CIOP_END_SECTION = "---END SECTION---";
+
+    /**
+     * Important: CIOP/1.0 output must be EXACTLY one JSON value: a top-level array of operations.
+     * No extra commentary text.
+     *
+     * Also important: file_write "path" MUST exactly match one of the provided FILE section paths.
+     */
+    private static final String CIOP_RESPONSE_INSTRUCTIONS = """
+        You are communicating with a CLI that implements CIOP/1.0.
+
+        OUTPUT REQUIREMENTS (MUST FOLLOW):
+        1) Your entire response MUST be exactly one JSON value: a top-level JSON array of operation objects.
+        2) Do NOT output any non-JSON text before or after the array (no markdown fences, no explanations).
+        3) Supported operations:
+           - {"op":"stdout","encoding":"utf-8"|"base64","data": "...", optional "length": <int>, optional "sha256":"<64 hex>"}
+           - {"op":"file_write","path":"<exact provided path>","encoding":"utf-8"|"base64","data":"...", optional "length": <int>, optional "sha256":"<64 hex>"}
+        4) "path" in file_write MUST exactly match one of the FILE section path= values you received (byte-for-byte string match).
+        5) For binary or non-UTF8 bytes, use encoding="base64".
+        6) If you detect any input verification failure (length/sha256 mismatch), respond with a stdout op explaining it and avoid file_write.
+
+        NOTES:
+        - For encoding "utf-8": "data" is a JSON string; interpret bytes as UTF-8.
+        - For encoding "base64": "data" is standard RFC4648 base64 of raw bytes.
+
+        Now process the CIOP/1.0 envelope provided.
+        """;
+
     private HelloChatGPT() {
     }
 
     public static void main(String[] args) {
         int exitCode = run(args);
-
-        /*
-         * At this point, our executors have terminated successfully.
-         * System.exit() is only needed to return a non-zero status.
-         */
         if (exitCode != 0) {
             System.exit(exitCode);
         }
@@ -44,19 +92,14 @@ public final class HelloChatGPT {
 
         if (apiKey == null || apiKey.isBlank()) {
             System.err.println("OPENAI_API_KEY is not set.");
-            System.err.println(
-                "Run: export OPENAI_API_KEY=\"your-api-key\""
-            );
+            System.err.println("Run: export OPENAI_API_KEY=\"your-api-key\"");
             return 1;
         }
 
         final byte[] stdinData;
 
         try {
-            /*
-             * Reads stdin as raw bytes until EOF. No character decoding
-             * happens here, so NUL bytes and invalid UTF-8 are preserved.
-             */
+            // Keep: stdin read as raw bytes (arbitrary binary)
             stdinData = System.in.readAllBytes();
         } catch (IOException exception) {
             System.err.println("Could not read standard input:");
@@ -64,29 +107,39 @@ public final class HelloChatGPT {
             return 1;
         }
 
-        if (stdinData.length == 0) {
-            System.err.println("No data was received on standard input.");
+        // Do not regress the existing behavior: stdin must be allowed to be arbitrary binary.
+        // (We no longer reject empty stdin; CIOP/1.0 allows length 0.)
+        List<Path> inputFiles;
+        try {
+            inputFiles = collectInputFiles(args);
+        } catch (RuntimeException exception) {
+            System.err.println("Invalid file arguments:");
+            exception.printStackTrace(System.err);
             return 1;
         }
 
         String prompt;
         try {
-            prompt = buildPromptFromStdinAndFiles(stdinData, args);
+            prompt = buildCiopPrompt(stdinData, inputFiles);
         } catch (IOException exception) {
             System.err.println("Could not read one or more input files:");
             exception.printStackTrace(System.err);
             return 1;
         }
 
+        // Log raw prompt as sent to API (post-marshaling).
+        try {
+            writeTmpLog("prompt.txt", prompt.getBytes(StandardCharsets.UTF_8));
+        } catch (IOException exception) {
+            System.err.println("Warning: could not write /tmp prompt log:");
+            exception.printStackTrace(System.err);
+        }
+
         ExecutorService httpExecutor =
-            Executors.newCachedThreadPool(
-                namedThreadFactory("openai-http-")
-            );
+            Executors.newCachedThreadPool(namedThreadFactory("openai-http-"));
 
         ExecutorService streamExecutor =
-            Executors.newCachedThreadPool(
-                namedThreadFactory("openai-stream-")
-            );
+            Executors.newCachedThreadPool(namedThreadFactory("openai-stream-"));
 
         OpenAIClient client = null;
         int exitCode = 0;
@@ -98,10 +151,9 @@ public final class HelloChatGPT {
                 .streamHandlerExecutor(streamExecutor)
                 .build();
 
-            //System.out.println(prompt);
             ResponseCreateParams request = ResponseCreateParams.builder()
                 .model("gpt-5.2")
-                .input(prompt)
+                .input(prompt) // Keep: single .input() call
                 .build();
 
             Response response = client.responses().create(request);
@@ -113,44 +165,48 @@ public final class HelloChatGPT {
                 .map(outputText -> outputText.text())
                 .collect(Collectors.joining());
 
-            System.out.println(output);
+            // Log raw model output before parsing.
+            try {
+                writeTmpLog("response.txt", output.getBytes(StandardCharsets.UTF_8));
+            } catch (IOException exception) {
+                System.err.println("Warning: could not write /tmp response log:");
+                exception.printStackTrace(System.err);
+            }
+
+            // Parse CIOP operations array JSON and apply
+            List<CiopOperation> ops = parseOperationsJsonArrayStrict(output);
+
+            // Apply in order; enforce file_write path allowlist == provided args exactly.
+            Set<String> allowedPaths = inputFiles.stream()
+                .map(Path::toString)
+                .collect(Collectors.toSet());
+
+            applyOperations(ops, allowedPaths);
 
         } catch (RuntimeException exception) {
             System.err.println("The OpenAI request failed:");
             exception.printStackTrace(System.err);
             exitCode = 1;
 
+        } catch (IOException exception) {
+            System.err.println("Failed while writing outputs:");
+            exception.printStackTrace(System.err);
+            exitCode = 1;
+
         } finally {
-            /*
-             * The OpenAI client owns the executors supplied to its builder
-             * and requests their shutdown when close() is called.
-             */
+            // Keep: graceful client close + wait for executors
             if (client != null) {
                 try {
                     client.close();
                 } catch (RuntimeException exception) {
-                    System.err.println(
-                        "The OpenAI client did not close cleanly:"
-                    );
+                    System.err.println("The OpenAI client did not close cleanly:");
                     exception.printStackTrace(System.err);
                     exitCode = 1;
                 }
             }
 
-            /*
-             * shutdown() is safe to call even if client.close() has already
-             * called it. Retaining the executor references lets us wait for
-             * their complete termination.
-             */
-            boolean httpStopped = shutdownAndAwait(
-                httpExecutor,
-                "OpenAI HTTP executor"
-            );
-
-            boolean streamStopped = shutdownAndAwait(
-                streamExecutor,
-                "OpenAI stream executor"
-            );
+            boolean httpStopped = shutdownAndAwait(httpExecutor, "OpenAI HTTP executor");
+            boolean streamStopped = shutdownAndAwait(streamExecutor, "OpenAI stream executor");
 
             if (!httpStopped || !streamStopped) {
                 exitCode = 1;
@@ -160,68 +216,137 @@ public final class HelloChatGPT {
         return exitCode;
     }
 
-    private static String buildPromptFromStdinAndFiles(
-        byte[] stdinData,
-        String[] args
-    ) throws IOException {
-        StringBuilder prompt = new StringBuilder();
+    private static List<Path> collectInputFiles(String[] args) {
+        List<Path> paths = new ArrayList<>();
 
-        // Always include stdin first (original behavior).
-        prompt.append("=== STDIN ===\n");
-        prompt.append(convertBytesToPrompt(stdinData));
-        prompt.append('\n');
-
-        // Zero or more file arguments.
-        //System.out.println("args.length= " + args.length);
-        if (args != null && args.length > 0) {
-            for (String arg : args) {
-                if (arg == null || arg.isBlank()) {
-                    continue;
-                }
-
-                //System.out.println("Processing file " + arg);
-                Path path = Path.of(arg);
-                byte[] fileData = Files.readAllBytes(path);
-                //System.out.println("contents " + new String(fileData, "UTF-8"));
-
-                prompt.append("\n=== FILE: ")
-                    .append(path)
-                    .append(" ===\n");
-
-                prompt.append(convertBytesToPrompt(fileData));
-                prompt.append('\n');
-            }
+        if (args == null || args.length == 0) {
+            return paths;
         }
 
-        return prompt.toString();
+        for (String arg : args) {
+            if (arg == null || arg.isBlank()) {
+                continue;
+            }
+            paths.add(Path.of(arg));
+        }
+
+        return paths;
     }
 
     /**
-     * Sends valid UTF-8 directly. Invalid UTF-8 is represented as Base64 so
-     * that no byte values are lost or replaced.
+     * Build a CIOP/1.0 envelope with:
+     * - STDIN section (always present)
+     * - FILE sections for each arg (including missing -> encoding=missing)
+     *
+     * Payload is always base64 for byte-safety and to avoid any marker collisions.
+     * (CIOP supports utf-8 but base64 is the safe default for arbitrary binary input.)
      */
-    private static String convertBytesToPrompt(byte[] data) {
-        String utf8Text = decodeStrictUtf8(data);
+    private static String buildCiopPrompt(byte[] stdinData, List<Path> inputFiles) throws IOException {
+        StringBuilder sb = new StringBuilder();
 
-        if (utf8Text != null) {
-            return utf8Text;
+        sb.append(CIOP_BEGIN).append('\n');
+
+        // STDIN section (always included, even if empty)
+        sb.append(buildSection(
+            "STDIN",
+            "base64",
+            stdinData,
+            null
+        ));
+
+        if (inputFiles != null && !inputFiles.isEmpty()) {
+            for (Path path : inputFiles) {
+                // Support non-existent files as args: encode as "missing" to disambiguate from empty.
+                if (!Files.exists(path)) {
+                    sb.append(buildMissingFileSection(path.toString()));
+                    continue;
+                }
+
+                byte[] fileData;
+                try {
+                    fileData = Files.readAllBytes(path);
+                } catch (IOException exception) {
+                    // Treat unreadable as missing at request time (still non-destructive).
+                    sb.append(buildMissingFileSection(path.toString()));
+                    continue;
+                }
+
+                sb.append(buildSection(
+                    "FILE",
+                    "base64",
+                    fileData,
+                    "path=" + path.toString()
+                ));
+            }
         }
 
-        String base64 = Base64.getEncoder().encodeToString(data);
+        sb.append(CIOP_END).append('\n');
 
-        return """
-            The standard-input payload is arbitrary binary data.
+        // Strongly discouraged by spec but allowed: add minimal response instructions AFTER envelope.
+        sb.append('\n').append(CIOP_RESPONSE_INSTRUCTIONS);
 
-            It has been encoded with standard Base64 so that every input byte
-            is preserved exactly. Decode the Base64 payload before interpreting
-            the data. Do not treat the Base64 characters themselves as the
-            original content.
+        return sb.toString();
+    }
 
-            Original byte length: %d
+    private static String buildMissingFileSection(String pathString) {
+        // encoding=missing, length=0, sha256 = sha256(empty)
+        byte[] empty = new byte[0];
+        String sha = sha256Hex(empty);
 
-            Base64 payload:
-            %s
-            """.formatted(data.length, base64);
+        return new StringBuilder()
+            .append("---SECTION FILE missing 0 ").append(sha).append(' ')
+            .append("path=").append(pathString)
+            .append("---\n")
+            // No payload block for missing; still follow "payload begins next line" notion by just ending section.
+            // Since length is 0, recipient should decode to empty bytes.
+            .append('\n')
+            .append(CIOP_END_SECTION).append('\n')
+            .toString();
+    }
+
+    private static String buildSection(
+        String source,           // STDIN or FILE
+        String encoding,         // base64 or utf-8
+        byte[] rawBytes,
+        String metaOrNull        // e.g. "path=notes.txt"
+    ) {
+        if (!"STDIN".equals(source) && !"FILE".equals(source)) {
+            throw new IllegalArgumentException("Invalid CIOP source: " + source);
+        }
+        if (!"base64".equals(encoding) && !"utf-8".equals(encoding)) {
+            throw new IllegalArgumentException("Invalid CIOP encoding: " + encoding);
+        }
+
+        String sha = sha256Hex(rawBytes);
+        int length = rawBytes.length;
+
+        String header = "---SECTION " + source + " " + encoding + " " + length + " " + sha +
+            (metaOrNull == null ? "" : (" " + metaOrNull)) +
+            "---";
+
+        String payloadText;
+        if ("utf-8".equals(encoding)) {
+            // Only safe if bytes are valid UTF-8; for our default we always use base64.
+            String utf8 = decodeStrictUtf8(rawBytes);
+            if (utf8 == null) {
+                // Fall back to base64 if caller tried utf-8 on non-utf8 bytes.
+                encoding = "base64";
+                header = "---SECTION " + source + " " + encoding + " " + length + " " + sha +
+                    (metaOrNull == null ? "" : (" " + metaOrNull)) +
+                    "---";
+                payloadText = Base64.getEncoder().encodeToString(rawBytes);
+            } else {
+                payloadText = utf8;
+            }
+        } else {
+            payloadText = Base64.getEncoder().encodeToString(rawBytes);
+        }
+
+        return new StringBuilder()
+            .append(header).append('\n')
+            .append(payloadText).append('\n')
+            .append(CIOP_END_SECTION).append('\n')
+            .toString();
     }
 
     /**
@@ -235,48 +360,443 @@ public final class HelloChatGPT {
                 .onUnmappableCharacter(CodingErrorAction.REPORT)
                 .decode(ByteBuffer.wrap(data))
                 .toString();
-
         } catch (CharacterCodingException exception) {
             return null;
         }
     }
 
+    private static String sha256Hex(byte[] bytes) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] digest = md.digest(bytes);
+            // Lowercase hex as required
+            return HexFormat.of().formatHex(digest);
+        } catch (NoSuchAlgorithmException e) {
+            // Should never happen on a normal JVM
+            throw new RuntimeException("SHA-256 not available", e);
+        }
+    }
+
+    // -------------------- CIOP output operations parsing/apply --------------------
+
+    private enum OpEncoding {
+        UTF_8("utf-8"),
+        BASE64("base64");
+
+        final String token;
+
+        OpEncoding(String token) {
+            this.token = token;
+        }
+
+        static OpEncoding fromToken(String token) {
+            if (token == null) return null;
+            String t = token.toLowerCase(Locale.ROOT);
+            return switch (t) {
+                case "utf-8" -> UTF_8;
+                case "base64" -> BASE64;
+                default -> null;
+            };
+        }
+    }
+
+    private static final class CiopOperation {
+        final String op;
+        final String path; // for file_write
+        final OpEncoding encoding;
+        final String data;
+        final Long length;   // optional
+        final String sha256; // optional (lowercase hex expected)
+
+        CiopOperation(String op, String path, OpEncoding encoding, String data, Long length, String sha256) {
+            this.op = op;
+            this.path = path;
+            this.encoding = encoding;
+            this.data = data;
+            this.length = length;
+            this.sha256 = sha256;
+        }
+
+        byte[] decodeDataBytes() {
+            if (encoding == null) {
+                throw new IllegalArgumentException("Operation missing/invalid encoding");
+            }
+            if (data == null) {
+                throw new IllegalArgumentException("Operation missing data");
+            }
+            return switch (encoding) {
+                case UTF_8 -> data.getBytes(StandardCharsets.UTF_8);
+                case BASE64 -> {
+                    String normalized = data.strip();
+                    if (normalized.isEmpty()) {
+                        yield new byte[0];
+                    }
+                    yield Base64.getDecoder().decode(normalized);
+                }
+            };
+        }
+    }
+
+    private static void applyOperations(List<CiopOperation> ops, Set<String> allowedFilePaths) throws IOException {
+        if (ops == null) {
+            throw new IllegalArgumentException("Operations array was null");
+        }
+
+        for (CiopOperation op : ops) {
+            if (op == null || op.op == null) {
+                throw new IllegalArgumentException("Invalid operation (null)");
+            }
+
+            byte[] bytes = op.decodeDataBytes();
+
+            // Optional verification (recommended by spec): if present and mismatched, abort file writes.
+            if (op.length != null && op.length != bytes.length) {
+                throw new IllegalArgumentException(
+                    "Output verification failed for op=" + op.op + ": length mismatch; expected " + op.length + " got " + bytes.length
+                );
+            }
+            if (op.sha256 != null) {
+                String expected = op.sha256.toLowerCase(Locale.ROOT);
+                String actual = sha256Hex(bytes);
+                if (!actual.equals(expected)) {
+                    throw new IllegalArgumentException(
+                        "Output verification failed for op=" + op.op + ": sha256 mismatch; expected " + expected + " got " + actual
+                    );
+                }
+            }
+
+            switch (op.op) {
+                case "stdout" -> {
+                    System.out.write(bytes);
+                    System.out.flush();
+                }
+                case "file_write" -> {
+                    if (op.path == null || op.path.isBlank()) {
+                        throw new IllegalArgumentException("file_write missing path");
+                    }
+                    // Security requirement: impossible to write any file not supplied as args.
+                    if (!allowedFilePaths.contains(op.path)) {
+                        throw new IllegalArgumentException(
+                            "Rejected file_write to non-allowlisted path: " + op.path
+                        );
+                    }
+                    Files.write(Path.of(op.path), bytes);
+                }
+                default -> throw new IllegalArgumentException("Unknown op: " + op.op);
+            }
+        }
+    }
+
+    /**
+     * Strictly parses the model output as exactly one JSON value (array).
+     * No leading/trailing non-whitespace. We implement a minimal JSON parser for the subset we need:
+     * - top-level array
+     * - array of objects with string keys and values that are: string, number, null
+     *
+     * This avoids adding new dependencies and enforces "no commentary text".
+     */
+    private static List<CiopOperation> parseOperationsJsonArrayStrict(String text) {
+        if (text == null) {
+            throw new IllegalArgumentException("Model output was null");
+        }
+
+        JsonTok tok = new JsonTok(text);
+        tok.skipWs();
+
+        Object value = tok.readValue();
+        tok.skipWs();
+
+        if (!tok.isEof()) {
+            throw new IllegalArgumentException("Model output had trailing non-whitespace after JSON value");
+        }
+
+        if (!(value instanceof List<?> list)) {
+            throw new IllegalArgumentException("Model output must be a top-level JSON array");
+        }
+
+        List<CiopOperation> ops = new ArrayList<>();
+        for (Object el : list) {
+            if (!(el instanceof Map<?, ?> m)) {
+                throw new IllegalArgumentException("Operations array must contain only objects");
+            }
+            @SuppressWarnings("unchecked")
+            Map<String, Object> obj = (Map<String, Object>) m;
+
+            String op = asString(obj.get("op"));
+            String path = asString(obj.get("path"));
+            OpEncoding enc = OpEncoding.fromToken(asString(obj.get("encoding")));
+            String data = asString(obj.get("data"));
+            Long length = asLongOrNull(obj.get("length"));
+            String sha256 = asString(obj.get("sha256"));
+
+            if (op == null || op.isBlank()) {
+                throw new IllegalArgumentException("Operation missing 'op'");
+            }
+            if ("stdout".equals(op)) {
+                if (path != null) {
+                    // tolerate but ignore; spec doesn't include path for stdout
+                }
+            } else if ("file_write".equals(op)) {
+                if (path == null || path.isBlank()) {
+                    throw new IllegalArgumentException("file_write missing 'path'");
+                }
+            } else {
+                throw new IllegalArgumentException("Unknown op: " + op);
+            }
+            if (enc == null) {
+                throw new IllegalArgumentException("Operation has unknown/unsupported encoding: " + obj.get("encoding"));
+            }
+            if (data == null) {
+                throw new IllegalArgumentException("Operation missing 'data'");
+            }
+
+            ops.add(new CiopOperation(op, path, enc, data, length, sha256));
+        }
+
+        return ops;
+    }
+
+    private static String asString(Object o) {
+        if (o == null) return null;
+        if (o instanceof String s) return s;
+        return null;
+    }
+
+    private static Long asLongOrNull(Object o) {
+        if (o == null) return null;
+        if (o instanceof Long l) return l;
+        if (o instanceof Integer i) return i.longValue();
+        if (o instanceof Double d) {
+            if (d.isNaN() || d.isInfinite()) return null;
+            long l = (long) d.doubleValue();
+            if (Math.abs(d - l) < 1e-9) return l;
+            return null;
+        }
+        return null;
+    }
+
+    /**
+     * Minimal JSON tokenizer/parser for our strict needs.
+     * Supports: objects, arrays, strings (with escapes), numbers, true/false/null.
+     */
+    private static final class JsonTok {
+        private final String s;
+        private int i;
+
+        JsonTok(String s) {
+            this.s = s;
+            this.i = 0;
+        }
+
+        boolean isEof() {
+            return i >= s.length();
+        }
+
+        void skipWs() {
+            while (i < s.length()) {
+                char c = s.charAt(i);
+                if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+                    i++;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Object readValue() {
+            skipWs();
+            if (i >= s.length()) throw err("Unexpected EOF");
+
+            char c = s.charAt(i);
+            return switch (c) {
+                case '{' -> readObject();
+                case '[' -> readArray();
+                case '"' -> readString();
+                case 't' -> readLiteral("true", Boolean.TRUE);
+                case 'f' -> readLiteral("false", Boolean.FALSE);
+                case 'n' -> readLiteral("null", null);
+                default -> {
+                    if (c == '-' || (c >= '0' && c <= '9')) {
+                        yield readNumber();
+                    }
+                    throw err("Unexpected character: " + c);
+                }
+            };
+        }
+
+        private Map<String, Object> readObject() {
+            expect('{');
+            skipWs();
+            Map<String, Object> m = new LinkedHashMap<>();
+            if (peek('}')) {
+                i++;
+                return m;
+            }
+            while (true) {
+                skipWs();
+                String key = readString();
+                skipWs();
+                expect(':');
+                Object val = readValue();
+                m.put(key, val);
+                skipWs();
+                if (peek('}')) {
+                    i++;
+                    return m;
+                }
+                expect(',');
+            }
+        }
+
+        private List<Object> readArray() {
+            expect('[');
+            skipWs();
+            List<Object> list = new ArrayList<>();
+            if (peek(']')) {
+                i++;
+                return list;
+            }
+            while (true) {
+                Object v = readValue();
+                list.add(v);
+                skipWs();
+                if (peek(']')) {
+                    i++;
+                    return list;
+                }
+                expect(',');
+            }
+        }
+
+        private String readString() {
+            expect('"');
+            StringBuilder out = new StringBuilder();
+            while (i < s.length()) {
+                char c = s.charAt(i++);
+                if (c == '"') {
+                    return out.toString();
+                }
+                if (c == '\\') {
+                    if (i >= s.length()) throw err("Bad escape at EOF");
+                    char e = s.charAt(i++);
+                    switch (e) {
+                        case '"', '\\', '/' -> out.append(e);
+                        case 'b' -> out.append('\b');
+                        case 'f' -> out.append('\f');
+                        case 'n' -> out.append('\n');
+                        case 'r' -> out.append('\r');
+                        case 't' -> out.append('\t');
+                        case 'u' -> {
+                            if (i + 4 > s.length()) throw err("Bad unicode escape");
+                            int cp = parseHex4(s, i);
+                            i += 4;
+                            out.append((char) cp);
+                        }
+                        default -> throw err("Bad escape: \\" + e);
+                    }
+                } else {
+                    out.append(c);
+                }
+            }
+            throw err("Unterminated string");
+        }
+
+        private Object readNumber() {
+            int start = i;
+            if (peek('-')) i++;
+            if (peek('0')) {
+                i++;
+            } else if (i < s.length() && Character.isDigit(s.charAt(i))) {
+                while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
+            } else {
+                throw err("Invalid number");
+            }
+
+            boolean isFloat = false;
+            if (peek('.')) {
+                isFloat = true;
+                i++;
+                if (i >= s.length() || !Character.isDigit(s.charAt(i))) throw err("Invalid fraction");
+                while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
+            }
+            if (peek('e') || peek('E')) {
+                isFloat = true;
+                i++;
+                if (peek('+') || peek('-')) i++;
+                if (i >= s.length() || !Character.isDigit(s.charAt(i))) throw err("Invalid exponent");
+                while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
+            }
+
+            String num = s.substring(start, i);
+            try {
+                if (!isFloat) {
+                    // prefer Long
+                    return Long.parseLong(num);
+                }
+                return Double.parseDouble(num);
+            } catch (NumberFormatException e) {
+                throw err("Invalid number: " + num);
+            }
+        }
+
+        private Object readLiteral(String literal, Object value) {
+            if (s.regionMatches(i, literal, 0, literal.length())) {
+                i += literal.length();
+                return value;
+            }
+            throw err("Expected literal: " + literal);
+        }
+
+        private boolean peek(char c) {
+            return i < s.length() && s.charAt(i) == c;
+        }
+
+        private void expect(char c) {
+            if (i >= s.length() || s.charAt(i) != c) {
+                throw err("Expected '" + c + "'");
+            }
+            i++;
+        }
+
+        private IllegalArgumentException err(String msg) {
+            return new IllegalArgumentException(msg + " at index " + i);
+        }
+
+        private static int parseHex4(String s, int offset) {
+            int v = 0;
+            for (int k = 0; k < 4; k++) {
+                char c = s.charAt(offset + k);
+                int d;
+                if (c >= '0' && c <= '9') d = c - '0';
+                else if (c >= 'a' && c <= 'f') d = 10 + (c - 'a');
+                else if (c >= 'A' && c <= 'F') d = 10 + (c - 'A');
+                else throw new IllegalArgumentException("Invalid hex in \\u escape");
+                v = (v << 4) | d;
+            }
+            return v;
+        }
+    }
+
+    // -------------------- existing shutdown/log helpers (kept) --------------------
+
     private static ThreadFactory namedThreadFactory(String prefix) {
         AtomicInteger threadNumber = new AtomicInteger(1);
 
         return task -> {
-            Thread thread = new Thread(
-                task,
-                prefix + threadNumber.getAndIncrement()
-            );
-
-            /*
-             * Non-daemon threads ensure that a shutdown defect is visible
-             * rather than being hidden by JVM termination.
-             */
+            Thread thread = new Thread(task, prefix + threadNumber.getAndIncrement());
             thread.setDaemon(false);
             return thread;
         };
     }
 
-    private static boolean shutdownAndAwait(
-        ExecutorService executor,
-        String description
-    ) {
+    private static boolean shutdownAndAwait(ExecutorService executor, String description) {
         executor.shutdown();
 
         try {
-            if (executor.awaitTermination(
-                SHUTDOWN_TIMEOUT_SECONDS,
-                TimeUnit.SECONDS
-            )) {
+            if (executor.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
                 return true;
             }
 
-            /*
-             * Do not use shutdownNow() here: that would interrupt running
-             * work rather than completing a fully graceful shutdown.
-             */
             System.err.printf(
                 "%s did not terminate gracefully within %d seconds.%n",
                 description,
@@ -289,12 +809,39 @@ public final class HelloChatGPT {
             Thread.currentThread().interrupt();
 
             System.err.println(
-                "Interrupted while waiting for " +
-                description +
-                " to terminate."
+                "Interrupted while waiting for " + description + " to terminate."
             );
 
             return false;
+        }
+    }
+
+    private static void writeTmpLog(String suffix, byte[] data) throws IOException {
+        String ts = LOG_TS.format(Instant.now());
+        String pid = getPidBestEffort();
+        int seq = LOG_SEQ.getAndIncrement();
+
+        String filename = "ai-" + ts + "-" + pid + "-" + seq + "-" + suffix;
+        Path path = Path.of("/tmp", filename);
+
+        Files.write(
+            path,
+            data,
+            StandardOpenOption.CREATE_NEW,
+            StandardOpenOption.WRITE
+        );
+    }
+
+    private static String getPidBestEffort() {
+        try {
+            return Long.toString(ProcessHandle.current().pid());
+        } catch (Throwable ignored) {
+            String jvmName = ManagementFactory.getRuntimeMXBean().getName();
+            int at = jvmName.indexOf('@');
+            if (at > 0) {
+                return jvmName.substring(0, at);
+            }
+            return jvmName;
         }
     }
 }
