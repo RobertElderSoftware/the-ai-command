@@ -3,84 +3,89 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="
-             http://maven.apache.org/POM/4.0.0
-             https://maven.apache.org/xsd/maven-4.0.0.xsd">
+           http://maven.apache.org/POM/4.0.0
+           https://maven.apache.org/xsd/maven-4.0.0.xsd">
 
-    <modelVersion>4.0.0</modelVersion>
+  <modelVersion>4.0.0</modelVersion>
 
-    <groupId>example</groupId>
-    <artifactId>hello-chatgpt</artifactId>
-    <version>1.0</version>
+  <groupId>example</groupId>
+  <artifactId>hello-chatgpt</artifactId>
+  <version>1.0</version>
 
-    <properties>
-        <maven.compiler.release>17</maven.compiler.release>
-        <project.build.sourceEncoding>
-            UTF-8
-        </project.build.sourceEncoding>
-    </properties>
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>
+      UTF-8
+    </project.build.sourceEncoding>
+  </properties>
 
-    <dependencies>
-        <dependency>
-            <groupId>com.openai</groupId>
-            <artifactId>openai-java</artifactId>
-            <version>4.45.0</version>
-        </dependency>
-    </dependencies>
+  <dependencies>
+    <dependency>
+      <groupId>com.openai</groupId>
+      <artifactId>openai-java</artifactId>
+      <version>4.45.0</version>
+    </dependency>
 
-    <build>
-        <finalName>hello-chatgpt</finalName>
+    <dependency>
+      <groupId>com.google.code.gson</groupId>
+      <artifactId>gson</artifactId>
+      <version>2.11.0</version>
+    </dependency>
+  </dependencies>
 
-        <plugins>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-shade-plugin</artifactId>
-                <version>3.6.2</version>
+  <build>
+    <finalName>hello-chatgpt</finalName>
 
-                <executions>
-                    <execution>
-                        <phase>package</phase>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.2</version>
 
-                        <goals>
-                            <goal>shade</goal>
-                        </goals>
+        <executions>
+          <execution>
+            <phase>package</phase>
 
-                        <configuration>
-                            <createDependencyReducedPom>
-                                false
-                            </createDependencyReducedPom>
+            <goals>
+              <goal>shade</goal>
+            </goals>
 
-                            <!-- Remove signatures invalidated by repackaging. -->
-                            <filters>
-                                <filter>
-                                    <artifact>*:*</artifact>
+            <configuration>
+              <createDependencyReducedPom>
+                false
+              </createDependencyReducedPom>
 
-                                    <excludes>
-                                        <exclude>META-INF/*.SF</exclude>
-                                        <exclude>META-INF/*.DSA</exclude>
-                                        <exclude>META-INF/*.RSA</exclude>
-                                    </excludes>
-                                </filter>
-                            </filters>
+              <!-- Remove signatures invalidated by repackaging. -->
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
 
-                            <transformers>
-                                <!-- Merge Java service-provider declarations. -->
-                                <transformer implementation=
-                                    "org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                  </excludes>
+                </filter>
+              </filters>
 
-                                <!-- Add Main-Class to the JAR manifest. -->
-                                <transformer implementation=
-                                    "org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+              <transformers>
+                <!-- Merge Java service-provider declarations. -->
+                <transformer implementation=
+                               "org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
 
-                                    <mainClass>
-                                        example.HelloChatGPT
-                                    </mainClass>
-                                </transformer>
-                            </transformers>
-                        </configuration>
-                    </execution>
-                </executions>
-            </plugin>
-        </plugins>
-    </build>
+                <!-- Add Main-Class to the JAR manifest. -->
+                <transformer implementation=
+                               "org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>
+                    example.HelloChatGPT
+                  </mainClass>
+                </transformer>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
 
 </project>
