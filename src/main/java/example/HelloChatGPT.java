@@ -76,7 +76,7 @@ public final class HelloChatGPT {
                - {"op":"file_write","path":"<exact provided path>","encoding":"utf-8"|"base64","data":"...", optional "length": <int>, optional "sha256":"<64 hex>"}
             4) "path" in file_write MUST exactly match one of the FILE section path= values you received (byte-for-byte string match).
             5) For binary or non-UTF8 bytes, use encoding="base64".
-            6) If you detect any input verification failure (length/sha256 mismatch), respond with a stdout op explaining it and avoid file_write.
+            6) If you detect any input verification failure (length/sha256 mismatch), respond with a stdout op explaining it, but otherwise continue to the best of your ability.
 
             NOTES:
             - For encoding "utf-8": "data" is a JSON string; interpret bytes as UTF-8.
