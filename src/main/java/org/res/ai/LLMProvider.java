@@ -1,4 +1,4 @@
-package example;
+package org.res.ai;
 
 /**
  * Generic interface for an LLM backend that takes a single prompt string and returns a single output string.

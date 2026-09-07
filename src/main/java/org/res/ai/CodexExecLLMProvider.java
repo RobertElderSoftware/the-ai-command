@@ -1,4 +1,4 @@
-package example;
+package org.res.ai;
 
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
@@ -61,6 +61,7 @@ public final class CodexExecLLMProvider implements LLMProvider {
                 }
 
                 // stdout is the model output; stderr is debug/noise and can be ignored.
+                //System.err.println(new String(output.getStderrOutput(), StandardCharsets.UTF_8));
                 return new String(output.getStdoutOutput(), StandardCharsets.UTF_8);
             } catch (Exception e) {
                 throw e;

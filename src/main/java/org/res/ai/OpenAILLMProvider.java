@@ -1,4 +1,4 @@
-package example;
+package org.res.ai;
 
 import com.openai.client.OpenAIClient;
 import com.openai.client.okhttp.OpenAIOkHttpClient;
@@ -34,6 +34,13 @@ public final class OpenAILLMProvider implements LLMProvider {
     public void initialize() {
         if (client != null) {
             return;
+        }
+
+        String apiKey = System.getenv("OPENAI_API_KEY");
+        if (apiKey == null || apiKey.isBlank()) {
+            throw new IllegalStateException(
+                    "OPENAI_API_KEY is not set. Run: export OPENAI_API_KEY=\"your-api-key\""
+            );
         }
 
         client = OpenAIOkHttpClient.builder()

@@ -1,6 +1,5 @@
-package example;
+package org.res.ai;
 
-import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -24,7 +23,9 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -32,12 +33,15 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
-public final class HelloChatGPT {
+public final class TheAICommand {
 
     private static boolean strictMode = false;
     private static final long SHUTDOWN_TIMEOUT_SECONDS = 30;
+    private static final String DEFAULT_BACKEND = "codex";
+    private static final String DEFAULT_MODEL = "gpt-5.2";
 
     private static final DateTimeFormatter LOG_TS =
             DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss.SSS")
@@ -49,9 +53,6 @@ public final class HelloChatGPT {
     private static final String CIOP_BEGIN = "---BEGIN CIOP/1.0---";
     private static final String CIOP_END = "---END CIOP/1.0---";
     private static final String CIOP_END_SECTION = "---END SECTION---";
-
-    // GSON instance for strict JSON parsing (no hand-written parser)
-    private static final Gson GSON = new Gson();
 
     /**
      * Important: CIOP/1.0 output must be EXACTLY one JSON value: a top-level array of operations.
@@ -73,13 +74,16 @@ public final class HelloChatGPT {
             6) If you detect any input verification failure (length/sha256 mismatch), respond with a stdout op explaining it, but otherwise continue to the best of your ability.
 
             NOTES:
-            - For encoding "utf-8": "data" is a JSON string; interpret bytes as UTF-8.
+            - Input section length and sha256 describe the original bytes, before base64 encoding.
+            - For an input utf-8 section, the payload is literal UTF-8 text, not a JSON string.
+              The newline immediately before ---END SECTION--- is framing, not part of the payload.
+              Preserve all other payload whitespace, including any trailing newline.
+            - For encoding "utf-8": output "data" is a JSON string; interpret bytes as UTF-8.
             - For encoding "base64": "data" is standard RFC4648 base64 of raw bytes.
-
             Now process the CIOP/1.0 envelope provided.
             """;
 
-    private HelloChatGPT() {
+    private TheAICommand() {
     }
 
     public static void main(String[] args) {
@@ -90,11 +94,11 @@ public final class HelloChatGPT {
     }
 
     private static int run(String[] args) {
-        String apiKey = System.getenv("OPENAI_API_KEY");
-
-        if (apiKey == null || apiKey.isBlank()) {
-            System.err.println("OPENAI_API_KEY is not set.");
-            System.err.println("Run: export OPENAI_API_KEY=\"your-api-key\"");
+        final CliOptions options;
+        try {
+            options = parseCliOptions(args);
+        } catch (IllegalArgumentException exception) {
+            System.err.println("Invalid command-line arguments: " + exception.getMessage());
             return 1;
         }
 
@@ -113,7 +117,7 @@ public final class HelloChatGPT {
         // (We no longer reject empty stdin; CIOP/1.0 allows length 0.)
         List<Path> inputFiles;
         try {
-            inputFiles = collectInputFiles(args);
+            inputFiles = collectInputFiles(options.inputFileArgs());
         } catch (RuntimeException exception) {
             System.err.println("Invalid file arguments: ");
             exception.printStackTrace(System.err);
@@ -147,8 +151,20 @@ public final class HelloChatGPT {
         int exitCode = 0;
 
         try {
-            provider = new OpenAILLMProvider(httpExecutor, streamExecutor, "gpt-5.2");
-            // provider = new CodexExecLLMProvider(); // Swap to use `codex exec` backend.
+            Map<String, Function<String, LLMProvider>> providerFactories = new LinkedHashMap<>();
+            providerFactories.put("openai", model ->
+                    new OpenAILLMProvider(httpExecutor, streamExecutor, model));
+            providerFactories.put("codex", model -> new CodexExecLLMProvider());
+
+            Function<String, LLMProvider> providerFactory = providerFactories.get(options.backend());
+            if (providerFactory == null) {
+                throw new IllegalArgumentException(
+                        "Unknown backend '" + options.backend() + "'. Supported backends: "
+                                + String.join(", ", providerFactories.keySet())
+                );
+            }
+
+            provider = providerFactory.apply(options.model());
             provider.initialize();
 
             String output = provider.complete(prompt);
@@ -204,6 +220,56 @@ public final class HelloChatGPT {
         return exitCode;
     }
 
+    private record CliOptions(String backend, String model, String[] inputFileArgs) {
+    }
+
+    private static CliOptions parseCliOptions(String[] args) {
+        String backend = DEFAULT_BACKEND;
+        String model = DEFAULT_MODEL;
+        List<String> inputFileArgs = new ArrayList<>();
+        boolean parseOptions = true;
+
+        if (args != null) {
+            for (int index = 0; index < args.length; index++) {
+                String arg = args[index];
+                if (parseOptions && "--".equals(arg)) {
+                    parseOptions = false;
+                } else if (parseOptions && "--backend".equals(arg)) {
+                    backend = requireOptionValue(args, ++index, "--backend");
+                } else if (parseOptions && arg != null && arg.startsWith("--backend=")) {
+                    backend = requireInlineOptionValue(arg, "--backend");
+                } else if (parseOptions && "--model".equals(arg)) {
+                    model = requireOptionValue(args, ++index, "--model");
+                } else if (parseOptions && arg != null && arg.startsWith("--model=")) {
+                    model = requireInlineOptionValue(arg, "--model");
+                } else {
+                    inputFileArgs.add(arg);
+                }
+            }
+        }
+
+        return new CliOptions(
+                backend.toLowerCase(Locale.ROOT),
+                model,
+                inputFileArgs.toArray(String[]::new)
+        );
+    }
+
+    private static String requireOptionValue(String[] args, int index, String option) {
+        if (index >= args.length || args[index] == null || args[index].isBlank()) {
+            throw new IllegalArgumentException(option + " requires a non-blank value");
+        }
+        return args[index];
+    }
+
+    private static String requireInlineOptionValue(String arg, String option) {
+        String value = arg.substring(option.length() + 1);
+        if (value.isBlank()) {
+            throw new IllegalArgumentException(option + " requires a non-blank value");
+        }
+        return value;
+    }
+
     private static List<Path> collectInputFiles(String[] args) {
         List<Path> paths = new ArrayList<>();
 
@@ -226,8 +292,9 @@ public final class HelloChatGPT {
      * - STDIN section (always present)
      * - FILE sections for each arg (including missing -> encoding=missing)
      *
-     * Payload is always base64 for byte-safety and to avoid any marker collisions.
-     * (CIOP supports utf-8 but base64 is the safe default for arbitrary binary input.)
+     * Prefer literal UTF-8 text. Use base64 for invalid UTF-8, binary control
+     * characters, or payload lines that could be confused with CIOP framing.
+     * Length and SHA-256 always describe the original bytes.
      */
     private static String buildCiopPrompt(byte[] stdinData, List<Path> inputFiles) throws IOException {
         StringBuilder sb = new StringBuilder();
@@ -236,7 +303,7 @@ public final class HelloChatGPT {
         // STDIN section (always included, even if empty)
         sb.append(buildSection(
                 "STDIN",
-                "base64",
+                "utf-8",
                 stdinData,
                 null
         ));
@@ -260,7 +327,7 @@ public final class HelloChatGPT {
 
                 sb.append(buildSection(
                         "FILE",
-                        "base64",
+                        "utf-8",
                         fileData,
                         "path=" + path.toString()
                 ));
@@ -292,7 +359,7 @@ public final class HelloChatGPT {
 
     private static String buildSection(
             String source,           // STDIN or FILE
-            String encoding,         // base64 or utf-8
+            String encoding,         // base64 or preferred utf-8 (with safe fallback)
             byte[] rawBytes,
             String metaOrNull        // e.g. "path=notes.txt"
     ) {
@@ -303,36 +370,52 @@ public final class HelloChatGPT {
             throw new IllegalArgumentException("Invalid CIOP encoding: " + encoding);
         }
 
+        String payloadText = null;
+        if ("utf-8".equals(encoding)) {
+            String utf8 = decodeStrictUtf8(rawBytes);
+            if (utf8 != null && isSafeCiopText(utf8)) {
+                payloadText = utf8;
+            }
+        }
+        if (payloadText == null) {
+            encoding = "base64";
+            payloadText = Base64.getEncoder().encodeToString(rawBytes);
+        }
+
         String sha = sha256Hex(rawBytes);
         int length = rawBytes.length;
-
         String header = "---SECTION " + source + " " + encoding + " " + length + " " + sha +
                 (metaOrNull == null ? "" : (" " + metaOrNull)) +
                 "---";
 
-        String payloadText;
-        if ("utf-8".equals(encoding)) {
-            // Only safe if bytes are valid UTF-8; for our default we always use base64.
-            String utf8 = decodeStrictUtf8(rawBytes);
-            if (utf8 == null) {
-                // Fall back to base64 if caller tried utf-8 on non-utf8 bytes.
-                encoding = "base64";
-                header = "---SECTION " + source + " " + encoding + " " + length + " " + sha +
-                        (metaOrNull == null ? "" : (" " + metaOrNull)) +
-                        "---";
-                payloadText = Base64.getEncoder().encodeToString(rawBytes);
-            } else {
-                payloadText = utf8;
-            }
-        } else {
-            payloadText = Base64.getEncoder().encodeToString(rawBytes);
-        }
-
         return new StringBuilder()
                 .append(header).append('\n')
+                // Always add a separate framing newline, preserving payload whitespace exactly.
                 .append(payloadText).append('\n')
                 .append(CIOP_END_SECTION).append('\n')
                 .toString();
+    }
+
+    /**
+     * Valid UTF-8 can still contain binary controls or framing markers.
+     * Permit normal text whitespace; reserve base64 for other ISO controls.
+     */
+    private static boolean isSafeCiopText(String text) {
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (Character.isISOControl(ch) && ch != '\t' && ch != '\n' && ch != '\r') {
+                return false;
+            }
+        }
+
+        // Recognize LF, CRLF, and CR line boundaries, including the first/last line.
+        // Ignore surrounding whitespace when checking markers to avoid ambiguity
+        // for readers that trim delimiter lines; do not modify the actual payload.
+        return text.lines().map(String::strip).noneMatch(line ->
+                line.equals(CIOP_BEGIN)
+                        || line.equals(CIOP_END)
+                        || line.equals(CIOP_END_SECTION)
+                        || line.startsWith("---SECTION "));
     }
 
     /**
@@ -363,7 +446,7 @@ public final class HelloChatGPT {
         }
     }
 
-    // ---------------- CIOP output operations parsing/apply ----------------
+    // ---------------- CIOP output operations parsing/apply ---------------
 
     private enum OpEncoding {
         UTF_8("utf-8"),
@@ -568,7 +651,7 @@ public final class HelloChatGPT {
         }
     }
 
-    // ---------------- existing shutdown/log helpers (kept) ----------------
+    // ---------------- existing shutdown/log helpers (kept) ---------------
 
     private static ThreadFactory namedThreadFactory(String prefix) {
         AtomicInteger threadNumber = new AtomicInteger(1);

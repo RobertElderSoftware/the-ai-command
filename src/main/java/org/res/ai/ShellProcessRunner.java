@@ -1,51 +1,15 @@
-package example;
-
-import java.io.BufferedInputStream;
-import java.io.IOException;
-
-import java.io.IOException;
-
-import java.util.Set;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Arrays;
-import java.util.ArrayList;
-
-import java.util.Random;
-
+package org.res.ai;
 
 import java.io.File;
-import javax.imageio.ImageIO;
-import java.awt.image.BufferedImage;
-import java.awt.image.DataBufferByte;
-import java.awt.image.DataBufferInt;
-import java.io.FileOutputStream;
-
 import java.io.OutputStream;
-import java.io.InputStream;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.nio.charset.StandardCharsets;
-
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.util.stream.Collectors;
 import java.lang.ProcessBuilder.Redirect;
-import java.util.Map;
-import java.util.HashMap;
 import java.util.List;
-import java.util.ArrayList;
-
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
-
-
 public class ShellProcessRunner {
-
 	private List<String> commandParts = null;
 	private Map<String, String> environmentVariables = null;
 	private File commandWorkingDirectory = null;
@@ -91,7 +55,7 @@ public class ShellProcessRunner {
 		}
 
 		this.process = processBuilder.start();
-      
+    
 		this.stdOutThread = new ShellProcessReaderThread("stdout", this.process.getInputStream());
 		this.stdErrThread = new ShellProcessReaderThread("stderr", this.process.getErrorStream());
 
@@ -114,7 +78,6 @@ public class ShellProcessRunner {
 
 	public ShellProcessFinalResult getFinalResult() throws Exception{
 		/* Call this once to obtain the final result after the process has exited: */
-		while(!(stdOutFuture.isDone() && stdErrFuture.isDone())) {}
 		ShellProcessPartialResult r = new ShellProcessPartialResult(this.stdOutFuture.get(), this.stdErrFuture.get());
 		this.es.shutdown();
 		int exitCode = process.waitFor();
