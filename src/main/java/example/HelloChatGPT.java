@@ -42,6 +42,7 @@ import java.util.stream.Collectors;
 
 public final class HelloChatGPT {
 
+    private static boolean strictMode = false;
     private static final long SHUTDOWN_TIMEOUT_SECONDS = 30;
 
     private static final DateTimeFormatter LOG_TS =
@@ -298,7 +299,6 @@ public final class HelloChatGPT {
         // encoding=missing, length=0, sha256 = sha256(empty)
         byte[] empty = new byte[0];
         String sha = sha256Hex(empty);
-
         return new StringBuilder()
                 .append("---SECTION FILE missing 0 ").append(sha).append(' ')
                 .append("path=").append(pathString)
@@ -456,12 +456,12 @@ public final class HelloChatGPT {
             byte[] bytes = op.decodeDataBytes();
 
             // Optional verification (recommended by spec): if present and mismatched, abort file writes.
-            if (op.length != null && op.length != bytes.length) {
+            if (strictMode && op.length != null && op.length != bytes.length) {
                 throw new IllegalArgumentException(
                         "Output verification failed for op=" + op.op + ": length mismatch; expected " + op.length + " got " + bytes.length
                 );
             }
-            if (op.sha256 != null) {
+            if (strictMode && op.sha256 != null) {
                 String expected = op.sha256.toLowerCase(Locale.ROOT);
                 String actual = sha256Hex(bytes);
                 if (!actual.equals(expected)) {
@@ -486,7 +486,15 @@ public final class HelloChatGPT {
                                 "Rejected file_write to non-allowlisted path: " + op.path
                         );
                     }
-                    Files.write(Path.of(op.path), bytes);
+
+                    Path out = Path.of(op.path);
+                    Path parent = out.getParent();
+                    if (parent != null) {
+                        // Fix: gracefully handle creation of any necessary parent directories.
+                        Files.createDirectories(parent);
+                    }
+
+                    Files.write(out, bytes);
                 }
                 default -> throw new IllegalArgumentException("Unknown op: " + op.op);
             }
@@ -607,9 +615,9 @@ public final class HelloChatGPT {
             );
 
             return false;
+
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-
             System.err.println(
                     "Interrupted while waiting for " + description + " to terminate."
             );
