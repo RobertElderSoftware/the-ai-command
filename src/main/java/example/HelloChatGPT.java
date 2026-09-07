@@ -1,10 +1,5 @@
 package example;
 
-import com.openai.client.OpenAIClient;
-import com.openai.client.okhttp.OpenAIOkHttpClient;
-import com.openai.models.responses.Response;
-import com.openai.models.responses.ResponseCreateParams;
-
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
@@ -32,7 +27,6 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
-import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
@@ -149,29 +143,15 @@ public final class HelloChatGPT {
         ExecutorService streamExecutor =
                 Executors.newCachedThreadPool(namedThreadFactory("openai-stream-"));
 
-        OpenAIClient client = null;
+        LLMProvider provider = null;
         int exitCode = 0;
 
         try {
-            client = OpenAIOkHttpClient.builder()
-                    .fromEnv()
-                    .dispatcherExecutorService(httpExecutor)
-                    .streamHandlerExecutor(streamExecutor)
-                    .build();
+            provider = new OpenAILLMProvider(httpExecutor, streamExecutor, "gpt-5.2");
+            // provider = new CodexExecLLMProvider(); // Swap to use `codex exec` backend.
+            provider.initialize();
 
-            ResponseCreateParams request = ResponseCreateParams.builder()
-                    .model("gpt-5.2")
-                    .input(prompt) // Keep: single .input() call
-                    .build();
-
-            Response response = client.responses().create(request);
-
-            String output = response.output().stream()
-                    .flatMap(item -> item.message().stream())
-                    .flatMap(message -> message.content().stream())
-                    .flatMap(content -> content.outputText().stream())
-                    .map(outputText -> outputText.text())
-                    .collect(Collectors.joining());
+            String output = provider.complete(prompt);
 
             // Log raw model output before parsing.
             try {
@@ -192,7 +172,7 @@ public final class HelloChatGPT {
             applyOperations(ops, allowedPaths);
 
         } catch (RuntimeException exception) {
-            System.err.println("The OpenAI request failed: ");
+            System.err.println("The LLM request failed: ");
             exception.printStackTrace(System.err);
             exitCode = 1;
 
@@ -203,11 +183,11 @@ public final class HelloChatGPT {
 
         } finally {
             // Keep: graceful client close + wait for executors
-            if (client != null) {
+            if (provider != null) {
                 try {
-                    client.close();
+                    provider.close();
                 } catch (RuntimeException exception) {
-                    System.err.println("The OpenAI client did not close cleanly: ");
+                    System.err.println("The LLM provider did not close cleanly: ");
                     exception.printStackTrace(System.err);
                     exitCode = 1;
                 }
@@ -311,10 +291,10 @@ public final class HelloChatGPT {
     }
 
     private static String buildSection(
-            String source,          // STDIN or FILE
-            String encoding,        // base64 or utf-8
+            String source,           // STDIN or FILE
+            String encoding,         // base64 or utf-8
             byte[] rawBytes,
-            String metaOrNull       // e.g. "path=notes.txt"
+            String metaOrNull        // e.g. "path=notes.txt"
     ) {
         if (!"STDIN".equals(source) && !"FILE".equals(source)) {
             throw new IllegalArgumentException("Invalid CIOP source: " + source);
@@ -411,7 +391,7 @@ public final class HelloChatGPT {
         final String path; // for file_write
         final OpEncoding encoding;
         final String data;
-        final Long length;   // optional
+        final Long length; // optional
         final String sha256; // optional (lowercase hex expected)
 
         CiopOperation(String op, String path, OpEncoding encoding, String data, Long length, String sha256) {
@@ -592,7 +572,6 @@ public final class HelloChatGPT {
 
     private static ThreadFactory namedThreadFactory(String prefix) {
         AtomicInteger threadNumber = new AtomicInteger(1);
-
         return task -> {
             Thread thread = new Thread(task, prefix + threadNumber.getAndIncrement());
             thread.setDaemon(false);
@@ -615,7 +594,6 @@ public final class HelloChatGPT {
             );
 
             return false;
-
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             System.err.println(
