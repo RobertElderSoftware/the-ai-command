@@ -8,6 +8,14 @@ Do not make pull requests for this project.  I will ignore them.
 mvn clean package
 ```
 
+#  Tests
+
+To run test, run 
+
+```
+mvn test
+```
+
 #  Run
 
 You can run the program like this:

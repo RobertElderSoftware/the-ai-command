@@ -1,718 +1,78 @@
 package org.res.ai;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParseException;
-import com.google.gson.JsonPrimitive;
-
 import java.io.IOException;
-import java.lang.management.ManagementFactory;
-import java.nio.ByteBuffer;
-import java.nio.charset.CharacterCodingException;
-import java.nio.charset.CodingErrorAction;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.time.Instant;
-import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.Base64;
-import java.util.HexFormat;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Locale;
-import java.util.Set;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Function;
-import java.util.stream.Collectors;
 
+/** Command-line entry point. */
 public final class TheAICommand {
-
-    private static boolean strictMode = false;
-    private static final long SHUTDOWN_TIMEOUT_SECONDS = 30;
     private static final String DEFAULT_BACKEND = "codex";
     private static final String DEFAULT_MODEL = "gpt-5.2";
-
-    private static final DateTimeFormatter LOG_TS =
-            DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss.SSS")
-                    .withZone(ZoneId.systemDefault());
-
-    private static final AtomicInteger LOG_SEQ = new AtomicInteger(1);
-
-    // CIOP constants
-    private static final String CIOP_BEGIN = "---BEGIN CIOP/1.0---";
-    private static final String CIOP_END = "---END CIOP/1.0---";
-    private static final String CIOP_END_SECTION = "---END SECTION---";
-
-    /**
-     * Important: CIOP/1.0 output must be EXACTLY one JSON value: a top-level array of operations.
-     * No extra commentary text.
-     *
-     * Also important: file_write "path" MUST exactly match one of the provided FILE section paths.
-     */
-    private static final String CIOP_RESPONSE_INSTRUCTIONS = """
-            You are communicating with a CLI that implements CIOP/1.0.
-
-            OUTPUT REQUIREMENTS (MUST FOLLOW):
-            1) Your entire response MUST be exactly one JSON value: a top-level JSON array of operation objects.
-            2) Do NOT output any non-JSON text before or after the array (no markdown fences, no explanations).
-            3) Supported operations:
-               - {"op":"stdout","encoding":"utf-8"|"base64","data": "...", optional "length": <int>, optional "sha256":"<64 hex>"}
-               - {"op":"file_write","path":"<exact provided path>","encoding":"utf-8"|"base64","data":"...", optional "length": <int>, optional "sha256":"<64 hex>"}
-            4) "path" in file_write MUST exactly match one of the FILE section path= values you received (byte-for-byte string match).
-            5) For binary or non-UTF8 bytes, use encoding="base64".
-            6) If you detect any input verification failure (length/sha256 mismatch), respond with a stdout op explaining it, but otherwise continue to the best of your ability.
-
-            NOTES:
-            - Input section length and sha256 describe the original bytes, before base64 encoding.
-            - For an input utf-8 section, the payload is literal UTF-8 text, not a JSON string.
-              The newline immediately before ---END SECTION--- is framing, not part of the payload.
-              Preserve all other payload whitespace, including any trailing newline.
-            - For encoding "utf-8": output "data" is a JSON string; interpret bytes as UTF-8.
-            - For encoding "base64": "data" is standard RFC4648 base64 of raw bytes.
-            Now process the CIOP/1.0 envelope provided.
-            """;
 
     private TheAICommand() {
     }
 
     public static void main(String[] args) {
         int exitCode = run(args);
-        if (exitCode != 0) {
-            System.exit(exitCode);
+        if (exitCode != 0) System.exit(exitCode);
+    }
+
+    static int run(String[] args) {
+        try {
+            CliOptions options = parseOptions(args);
+            byte[] stdin = System.in.readAllBytes();
+            LLMProvider provider = switch (options.backend) {
+                case "openai" -> new OpenAILLMProvider(options.model);
+                case "codex" -> new CodexExecLLMProvider();
+                case "loopback" -> new LoopbackLLMProvider();
+                default -> throw new IllegalArgumentException("Unknown backend: " + options.backend);
+            };
+            try (AICommandApplication application =
+                         new AICommandApplication(provider, System.out, Path.of("."))) {
+                application.run(stdin, options.files);
+            }
+            return 0;
+        } catch (IOException | RuntimeException exception) {
+            System.err.println("The AI command failed:");
+            exception.printStackTrace(System.err);
+            return 1;
         }
     }
 
-    private static int run(String[] args) {
-        final CliOptions options;
-        try {
-            options = parseCliOptions(args);
-        } catch (IllegalArgumentException exception) {
-            System.err.println("Invalid command-line arguments: " + exception.getMessage());
-            return 1;
-        }
-
-        final byte[] stdinData;
-
-        try {
-            // Keep: stdin read as raw bytes (arbitrary binary)
-            stdinData = System.in.readAllBytes();
-        } catch (IOException exception) {
-            System.err.println("Could not read standard input: ");
-            exception.printStackTrace(System.err);
-            return 1;
-        }
-
-        // Do not regress the existing behavior: stdin must be allowed to be arbitrary binary.
-        // (We no longer reject empty stdin; CIOP/1.0 allows length 0.)
-        List<Path> inputFiles;
-        try {
-            inputFiles = collectInputFiles(options.inputFileArgs());
-        } catch (RuntimeException exception) {
-            System.err.println("Invalid file arguments: ");
-            exception.printStackTrace(System.err);
-            return 1;
-        }
-
-        String prompt;
-        try {
-            prompt = buildCiopPrompt(stdinData, inputFiles);
-        } catch (IOException exception) {
-            System.err.println("Could not read one or more input files:");
-            exception.printStackTrace(System.err);
-            return 1;
-        }
-
-        // Log raw prompt as sent to API (post-marshaling).
-        try {
-            writeTmpLog("prompt.txt", prompt.getBytes(StandardCharsets.UTF_8));
-        } catch (IOException exception) {
-            System.err.println("Warning: could not write /tmp prompt log:");
-            exception.printStackTrace(System.err);
-        }
-
-        ExecutorService httpExecutor =
-                Executors.newCachedThreadPool(namedThreadFactory("openai-http-"));
-
-        ExecutorService streamExecutor =
-                Executors.newCachedThreadPool(namedThreadFactory("openai-stream-"));
-
-        LLMProvider provider = null;
-        int exitCode = 0;
-
-        try {
-            Map<String, Function<String, LLMProvider>> providerFactories = new LinkedHashMap<>();
-            providerFactories.put("openai", model ->
-                    new OpenAILLMProvider(httpExecutor, streamExecutor, model));
-            providerFactories.put("codex", model -> new CodexExecLLMProvider());
-
-            Function<String, LLMProvider> providerFactory = providerFactories.get(options.backend());
-            if (providerFactory == null) {
-                throw new IllegalArgumentException(
-                        "Unknown backend '" + options.backend() + "'. Supported backends: "
-                                + String.join(", ", providerFactories.keySet())
-                );
-            }
-
-            provider = providerFactory.apply(options.model());
-            provider.initialize();
-
-            String output = provider.complete(prompt);
-
-            // Log raw model output before parsing.
-            try {
-                writeTmpLog("response.txt", output.getBytes(StandardCharsets.UTF_8));
-            } catch (IOException exception) {
-                System.err.println("Warning: could not write /tmp response log:");
-                exception.printStackTrace(System.err);
-            }
-
-            // Parse CIOP operations array JSON and apply
-            List<CiopOperation> ops = parseOperationsJsonArrayStrict(output);
-
-            // Apply in order; enforce file_write path allowlist == provided args exactly.
-            Set<String> allowedPaths = inputFiles.stream()
-                    .map(Path::toString)
-                    .collect(Collectors.toSet());
-
-            applyOperations(ops, allowedPaths);
-
-        } catch (RuntimeException exception) {
-            System.err.println("The LLM request failed: ");
-            exception.printStackTrace(System.err);
-            exitCode = 1;
-
-        } catch (IOException exception) {
-            System.err.println("Failed while writing outputs: ");
-            exception.printStackTrace(System.err);
-            exitCode = 1;
-
-        } finally {
-            // Keep: graceful client close + wait for executors
-            if (provider != null) {
-                try {
-                    provider.close();
-                } catch (RuntimeException exception) {
-                    System.err.println("The LLM provider did not close cleanly: ");
-                    exception.printStackTrace(System.err);
-                    exitCode = 1;
-                }
-            }
-
-            boolean httpStopped = shutdownAndAwait(httpExecutor, "OpenAI HTTP executor");
-            boolean streamStopped = shutdownAndAwait(streamExecutor, "OpenAI stream executor");
-
-            if (!httpStopped || !streamStopped) {
-                exitCode = 1;
-            }
-        }
-
-        return exitCode;
-    }
-
-    private record CliOptions(String backend, String model, String[] inputFileArgs) {
-    }
-
-    private static CliOptions parseCliOptions(String[] args) {
+    private static CliOptions parseOptions(String[] args) {
         String backend = DEFAULT_BACKEND;
         String model = DEFAULT_MODEL;
-        List<String> inputFileArgs = new ArrayList<>();
-        boolean parseOptions = true;
-
-        if (args != null) {
-            for (int index = 0; index < args.length; index++) {
-                String arg = args[index];
-                if (parseOptions && "--".equals(arg)) {
-                    parseOptions = false;
-                } else if (parseOptions && "--backend".equals(arg)) {
-                    backend = requireOptionValue(args, ++index, "--backend");
-                } else if (parseOptions && arg != null && arg.startsWith("--backend=")) {
-                    backend = requireInlineOptionValue(arg, "--backend");
-                } else if (parseOptions && "--model".equals(arg)) {
-                    model = requireOptionValue(args, ++index, "--model");
-                } else if (parseOptions && arg != null && arg.startsWith("--model=")) {
-                    model = requireInlineOptionValue(arg, "--model");
-                } else {
-                    inputFileArgs.add(arg);
-                }
+        List<String> files = new ArrayList<>();
+        boolean options = true;
+        for (int index = 0; args != null && index < args.length; index++) {
+            String argument = args[index];
+            if (options && "--".equals(argument)) {
+                options = false;
+            } else if (options && "--backend".equals(argument)) {
+                backend = requireValue(args, ++index, "--backend");
+            } else if (options && argument.startsWith("--backend=")) {
+                backend = argument.substring("--backend=".length());
+            } else if (options && "--model".equals(argument)) {
+                model = requireValue(args, ++index, "--model");
+            } else if (options && argument.startsWith("--model=")) {
+                model = argument.substring("--model=".length());
+            } else {
+                files.add(argument);
             }
         }
-
-        return new CliOptions(
-                backend.toLowerCase(Locale.ROOT),
-                model,
-                inputFileArgs.toArray(String[]::new)
-        );
+        if (backend.isBlank() || model.isBlank()) throw new IllegalArgumentException("Options must not be blank");
+        return new CliOptions(backend.toLowerCase(Locale.ROOT), model, List.copyOf(files));
     }
 
-    private static String requireOptionValue(String[] args, int index, String option) {
+    private static String requireValue(String[] args, int index, String option) {
         if (index >= args.length || args[index] == null || args[index].isBlank()) {
-            throw new IllegalArgumentException(option + " requires a non-blank value");
+            throw new IllegalArgumentException(option + " requires a value");
         }
         return args[index];
     }
 
-    private static String requireInlineOptionValue(String arg, String option) {
-        String value = arg.substring(option.length() + 1);
-        if (value.isBlank()) {
-            throw new IllegalArgumentException(option + " requires a non-blank value");
-        }
-        return value;
-    }
-
-    private static List<Path> collectInputFiles(String[] args) {
-        List<Path> paths = new ArrayList<>();
-
-        if (args == null || args.length == 0) {
-            return paths;
-        }
-
-        for (String arg : args) {
-            if (arg == null || arg.isBlank()) {
-                continue;
-            }
-            paths.add(Path.of(arg));
-        }
-
-        return paths;
-    }
-
-    /**
-     * Build a CIOP/1.0 envelope with:
-     * - STDIN section (always present)
-     * - FILE sections for each arg (including missing -> encoding=missing)
-     *
-     * Prefer literal UTF-8 text. Use base64 for invalid UTF-8, binary control
-     * characters, or payload lines that could be confused with CIOP framing.
-     * Length and SHA-256 always describe the original bytes.
-     */
-    private static String buildCiopPrompt(byte[] stdinData, List<Path> inputFiles) throws IOException {
-        StringBuilder sb = new StringBuilder();
-
-        sb.append(CIOP_BEGIN).append('\n');
-        // STDIN section (always included, even if empty)
-        sb.append(buildSection(
-                "STDIN",
-                "utf-8",
-                stdinData,
-                null
-        ));
-
-        if (inputFiles != null && !inputFiles.isEmpty()) {
-            for (Path path : inputFiles) {
-                // Support non-existent files as args: encode as "missing" to disambiguate from empty.
-                if (!Files.exists(path)) {
-                    sb.append(buildMissingFileSection(path.toString()));
-                    continue;
-                }
-
-                byte[] fileData;
-                try {
-                    fileData = Files.readAllBytes(path);
-                } catch (IOException exception) {
-                    // Treat unreadable as missing at request time (still non-destructive).
-                    sb.append(buildMissingFileSection(path.toString()));
-                    continue;
-                }
-
-                sb.append(buildSection(
-                        "FILE",
-                        "utf-8",
-                        fileData,
-                        "path=" + path.toString()
-                ));
-            }
-        }
-
-        sb.append(CIOP_END).append('\n');
-
-        // Strongly discouraged by spec but allowed: add minimal response instructions AFTER envelope.
-        sb.append('\n').append(CIOP_RESPONSE_INSTRUCTIONS);
-
-        return sb.toString();
-    }
-
-    private static String buildMissingFileSection(String pathString) {
-        // encoding=missing, length=0, sha256 = sha256(empty)
-        byte[] empty = new byte[0];
-        String sha = sha256Hex(empty);
-        return new StringBuilder()
-                .append("---SECTION FILE missing 0 ").append(sha).append(' ')
-                .append("path=").append(pathString)
-                .append("---\n")
-                // No payload block for missing; still follow "payload begins next line" notion by just ending section.
-                // Since length is 0, recipient should decode to empty bytes.
-                .append('\n')
-                .append(CIOP_END_SECTION).append('\n')
-                .toString();
-    }
-
-    private static String buildSection(
-            String source,           // STDIN or FILE
-            String encoding,         // base64 or preferred utf-8 (with safe fallback)
-            byte[] rawBytes,
-            String metaOrNull        // e.g. "path=notes.txt"
-    ) {
-        if (!"STDIN".equals(source) && !"FILE".equals(source)) {
-            throw new IllegalArgumentException("Invalid CIOP source: " + source);
-        }
-        if (!"base64".equals(encoding) && !"utf-8".equals(encoding)) {
-            throw new IllegalArgumentException("Invalid CIOP encoding: " + encoding);
-        }
-
-        String payloadText = null;
-        if ("utf-8".equals(encoding)) {
-            String utf8 = decodeStrictUtf8(rawBytes);
-            if (utf8 != null && isSafeCiopText(utf8)) {
-                payloadText = utf8;
-            }
-        }
-        if (payloadText == null) {
-            encoding = "base64";
-            payloadText = Base64.getEncoder().encodeToString(rawBytes);
-        }
-
-        String sha = sha256Hex(rawBytes);
-        int length = rawBytes.length;
-        String header = "---SECTION " + source + " " + encoding + " " + length + " " + sha +
-                (metaOrNull == null ? "" : (" " + metaOrNull)) +
-                "---";
-
-        return new StringBuilder()
-                .append(header).append('\n')
-                // Always add a separate framing newline, preserving payload whitespace exactly.
-                .append(payloadText).append('\n')
-                .append(CIOP_END_SECTION).append('\n')
-                .toString();
-    }
-
-    /**
-     * Valid UTF-8 can still contain binary controls or framing markers.
-     * Permit normal text whitespace; reserve base64 for other ISO controls.
-     */
-    private static boolean isSafeCiopText(String text) {
-        for (int i = 0; i < text.length(); i++) {
-            char ch = text.charAt(i);
-            if (Character.isISOControl(ch) && ch != '\t' && ch != '\n' && ch != '\r') {
-                return false;
-            }
-        }
-
-        // Recognize LF, CRLF, and CR line boundaries, including the first/last line.
-        // Ignore surrounding whitespace when checking markers to avoid ambiguity
-        // for readers that trim delimiter lines; do not modify the actual payload.
-        return text.lines().map(String::strip).noneMatch(line ->
-                line.equals(CIOP_BEGIN)
-                        || line.equals(CIOP_END)
-                        || line.equals(CIOP_END_SECTION)
-                        || line.startsWith("---SECTION "));
-    }
-
-    /**
-     * Returns null instead of silently replacing malformed byte sequences.
-     */
-    private static String decodeStrictUtf8(byte[] data) {
-        try {
-            return StandardCharsets.UTF_8
-                    .newDecoder()
-                    .onMalformedInput(CodingErrorAction.REPORT)
-                    .onUnmappableCharacter(CodingErrorAction.REPORT)
-                    .decode(ByteBuffer.wrap(data))
-                    .toString();
-        } catch (CharacterCodingException exception) {
-            return null;
-        }
-    }
-
-    private static String sha256Hex(byte[] bytes) {
-        try {
-            MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] digest = md.digest(bytes);
-            // Lowercase hex as required
-            return HexFormat.of().formatHex(digest);
-        } catch (NoSuchAlgorithmException e) {
-            // Should never happen on a normal JVM
-            throw new RuntimeException("SHA-256 not available", e);
-        }
-    }
-
-    // ---------------- CIOP output operations parsing/apply ---------------
-
-    private enum OpEncoding {
-        UTF_8("utf-8"),
-        BASE64("base64");
-
-        final String token;
-
-        OpEncoding(String token) {
-            this.token = token;
-        }
-
-        static OpEncoding fromToken(String token) {
-            if (token == null) return null;
-            String t = token.toLowerCase(Locale.ROOT);
-            return switch (t) {
-                case "utf-8" -> UTF_8;
-                case "base64" -> BASE64;
-                default -> null;
-            };
-        }
-    }
-
-    private static final class CiopOperation {
-        final String op;
-        final String path; // for file_write
-        final OpEncoding encoding;
-        final String data;
-        final Long length; // optional
-        final String sha256; // optional (lowercase hex expected)
-
-        CiopOperation(String op, String path, OpEncoding encoding, String data, Long length, String sha256) {
-            this.op = op;
-            this.path = path;
-            this.encoding = encoding;
-            this.data = data;
-            this.length = length;
-            this.sha256 = sha256;
-        }
-
-        byte[] decodeDataBytes() {
-            if (encoding == null) {
-                throw new IllegalArgumentException("Operation missing/invalid encoding");
-            }
-            if (data == null) {
-                throw new IllegalArgumentException("Operation missing data");
-            }
-            return switch (encoding) {
-                case UTF_8 -> data.getBytes(StandardCharsets.UTF_8);
-                case BASE64 -> {
-                    String normalized = data.strip();
-                    if (normalized.isEmpty()) {
-                        yield new byte[0];
-                    }
-                    yield Base64.getDecoder().decode(normalized);
-                }
-            };
-        }
-    }
-
-    private static void applyOperations(List<CiopOperation> ops, Set<String> allowedFilePaths) throws IOException {
-        if (ops == null) {
-            throw new IllegalArgumentException("Operations array was null");
-        }
-
-        for (CiopOperation op : ops) {
-            if (op == null || op.op == null) {
-                throw new IllegalArgumentException("Invalid operation (null)");
-            }
-
-            byte[] bytes = op.decodeDataBytes();
-
-            // Optional verification (recommended by spec): if present and mismatched, abort file writes.
-            if (strictMode && op.length != null && op.length != bytes.length) {
-                throw new IllegalArgumentException(
-                        "Output verification failed for op=" + op.op + ": length mismatch; expected " + op.length + " got " + bytes.length
-                );
-            }
-            if (strictMode && op.sha256 != null) {
-                String expected = op.sha256.toLowerCase(Locale.ROOT);
-                String actual = sha256Hex(bytes);
-                if (!actual.equals(expected)) {
-                    throw new IllegalArgumentException(
-                            "Output verification failed for op=" + op.op + ": sha256 mismatch; expected " + expected + " got " + actual
-                    );
-                }
-            }
-
-            switch (op.op) {
-                case "stdout" -> {
-                    System.out.write(bytes);
-                    System.out.flush();
-                }
-                case "file_write" -> {
-                    if (op.path == null || op.path.isBlank()) {
-                        throw new IllegalArgumentException("file_write missing path");
-                    }
-                    // Security requirement: impossible to write any file not supplied as args.
-                    if (!allowedFilePaths.contains(op.path)) {
-                        throw new IllegalArgumentException(
-                                "Rejected file_write to non-allowlisted path: " + op.path
-                        );
-                    }
-
-                    Path out = Path.of(op.path);
-                    Path parent = out.getParent();
-                    if (parent != null) {
-                        // Fix: gracefully handle creation of any necessary parent directories.
-                        Files.createDirectories(parent);
-                    }
-
-                    Files.write(out, bytes);
-                }
-                default -> throw new IllegalArgumentException("Unknown op: " + op.op);
-            }
-        }
-    }
-
-    /**
-     * Strictly parses the model output as exactly one JSON value (array).
-     * No leading/trailing non-whitespace.
-     */
-    private static List<CiopOperation> parseOperationsJsonArrayStrict(String text) {
-        if (text == null) {
-            throw new IllegalArgumentException("Model output was null");
-        }
-
-        final JsonElement root;
-        try {
-            root = com.google.gson.JsonParser.parseString(text);
-        } catch (JsonParseException e) {
-            throw new IllegalArgumentException("Model output was not valid JSON", e);
-        }
-
-        if (!root.isJsonArray()) {
-            throw new IllegalArgumentException("Model output must be a top-level JSON array");
-        }
-
-        JsonArray arr = root.getAsJsonArray();
-        List<CiopOperation> ops = new ArrayList<>();
-
-        for (JsonElement el : arr) {
-            if (el == null || !el.isJsonObject()) {
-                throw new IllegalArgumentException("Operations array must contain only objects");
-            }
-            JsonObject obj = el.getAsJsonObject();
-
-            String op = getAsStringOrNull(obj.get("op"));
-            String path = getAsStringOrNull(obj.get("path"));
-            OpEncoding enc = OpEncoding.fromToken(getAsStringOrNull(obj.get("encoding")));
-            String data = getAsStringOrNull(obj.get("data"));
-            Long length = getAsLongOrNull(obj.get("length"));
-            String sha256 = getAsStringOrNull(obj.get("sha256"));
-
-            if (op == null || op.isBlank()) {
-                throw new IllegalArgumentException("Operation missing 'op'");
-            }
-            if ("stdout".equals(op)) {
-                // tolerate but ignore path
-            } else if ("file_write".equals(op)) {
-                if (path == null || path.isBlank()) {
-                    throw new IllegalArgumentException("file_write missing 'path'");
-                }
-            } else {
-                throw new IllegalArgumentException("Unknown op: " + op);
-            }
-            if (enc == null) {
-                throw new IllegalArgumentException("Operation has unknown/unsupported encoding: " + getAsStringOrNull(obj.get("encoding")));
-            }
-            if (data == null) {
-                throw new IllegalArgumentException("Operation missing 'data'");
-            }
-
-            ops.add(new CiopOperation(op, path, enc, data, length, sha256));
-        }
-
-        return ops;
-    }
-
-    private static String getAsStringOrNull(JsonElement e) {
-        if (e == null || e.isJsonNull()) return null;
-        if (e.isJsonPrimitive()) {
-            JsonPrimitive p = e.getAsJsonPrimitive();
-            if (p.isString()) return p.getAsString();
-        }
-        return null;
-    }
-
-    private static Long getAsLongOrNull(JsonElement e) {
-        if (e == null || e.isJsonNull()) return null;
-        if (!e.isJsonPrimitive()) return null;
-        JsonPrimitive p = e.getAsJsonPrimitive();
-        if (!p.isNumber()) return null;
-        try {
-            // Enforce integer-ness
-            double d = p.getAsDouble();
-            if (Double.isNaN(d) || Double.isInfinite(d)) return null;
-            long l = (long) d;
-            if (Math.abs(d - l) < 1e-9) return l;
-            return null;
-        } catch (NumberFormatException ex) {
-            return null;
-        }
-    }
-
-    // ---------------- existing shutdown/log helpers (kept) ---------------
-
-    private static ThreadFactory namedThreadFactory(String prefix) {
-        AtomicInteger threadNumber = new AtomicInteger(1);
-        return task -> {
-            Thread thread = new Thread(task, prefix + threadNumber.getAndIncrement());
-            thread.setDaemon(false);
-            return thread;
-        };
-    }
-
-    private static boolean shutdownAndAwait(ExecutorService executor, String description) {
-        executor.shutdown();
-
-        try {
-            if (executor.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                return true;
-            }
-
-            System.err.printf(
-                    "%s did not terminate gracefully within %d seconds.%n",
-                    description,
-                    SHUTDOWN_TIMEOUT_SECONDS
-            );
-
-            return false;
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-            System.err.println(
-                    "Interrupted while waiting for " + description + " to terminate."
-            );
-
-            return false;
-        }
-    }
-
-    private static void writeTmpLog(String suffix, byte[] data) throws IOException {
-        String ts = LOG_TS.format(Instant.now());
-        String pid = getPidBestEffort();
-        int seq = LOG_SEQ.getAndIncrement();
-
-        String filename = "ai-" + ts + "-" + pid + "-" + seq + "-" + suffix;
-        Path path = Path.of("/tmp", filename);
-
-        Files.write(
-                path,
-                data,
-                StandardOpenOption.CREATE_NEW,
-                StandardOpenOption.WRITE
-        );
-    }
-
-    private static String getPidBestEffort() {
-        try {
-            return Long.toString(ProcessHandle.current().pid());
-        } catch (Throwable ignored) {
-            String jvmName = ManagementFactory.getRuntimeMXBean().getName();
-            int at = jvmName.indexOf('@');
-            if (at > 0) {
-                return jvmName.substring(0, at);
-            }
-            return jvmName;
-        }
+    private record CliOptions(String backend, String model, List<String> files) {
     }
 }

@@ -6,43 +6,37 @@ import com.openai.models.responses.Response;
 import com.openai.models.responses.ResponseCreateParams;
 
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
-/**
- * OpenAI implementation of {@link LLMProvider}.
- *
- * Owns the OpenAI client and the executors used by the underlying HTTP and stream handlers.
- */
+/** OpenAI backend which owns its client and all executors used by that client. */
 public final class OpenAILLMProvider implements LLMProvider {
+    private static final long SHUTDOWN_TIMEOUT_SECONDS = 30;
 
     private final ExecutorService httpExecutor;
     private final ExecutorService streamExecutor;
     private final String model;
-
     private OpenAIClient client;
 
-    public OpenAILLMProvider(ExecutorService httpExecutor, ExecutorService streamExecutor, String model) {
-        if (httpExecutor == null) throw new IllegalArgumentException("httpExecutor must not be null");
-        if (streamExecutor == null) throw new IllegalArgumentException("streamExecutor must not be null");
-        if (model == null || model.isBlank()) throw new IllegalArgumentException("model must not be blank");
-        this.httpExecutor = httpExecutor;
-        this.streamExecutor = streamExecutor;
+    public OpenAILLMProvider(String model) {
+        if (model == null || model.isBlank()) {
+            throw new IllegalArgumentException("model must not be blank");
+        }
         this.model = model;
+        this.httpExecutor = Executors.newCachedThreadPool(namedThreadFactory("openai-http-"));
+        this.streamExecutor = Executors.newCachedThreadPool(namedThreadFactory("openai-stream-"));
     }
 
     @Override
-    public void initialize() {
-        if (client != null) {
-            return;
-        }
-
+    public synchronized void initialize() {
+        if (client != null) return;
         String apiKey = System.getenv("OPENAI_API_KEY");
         if (apiKey == null || apiKey.isBlank()) {
-            throw new IllegalStateException(
-                    "OPENAI_API_KEY is not set. Run: export OPENAI_API_KEY=\"your-api-key\""
-            );
+            throw new IllegalStateException("OPENAI_API_KEY is not set");
         }
-
         client = OpenAIOkHttpClient.builder()
                 .fromEnv()
                 .dispatcherExecutorService(httpExecutor)
@@ -52,19 +46,12 @@ public final class OpenAILLMProvider implements LLMProvider {
 
     @Override
     public String complete(String prompt) {
-        if (prompt == null) {
-            throw new IllegalArgumentException("prompt must not be null");
-        }
-
+        if (prompt == null) throw new IllegalArgumentException("prompt must not be null");
         initialize();
-
-        ResponseCreateParams request = ResponseCreateParams.builder()
+        Response response = client.responses().create(ResponseCreateParams.builder()
                 .model(model)
                 .input(prompt)
-                .build();
-
-        Response response = client.responses().create(request);
-
+                .build());
         return response.output().stream()
                 .flatMap(item -> item.message().stream())
                 .flatMap(message -> message.content().stream())
@@ -74,14 +61,36 @@ public final class OpenAILLMProvider implements LLMProvider {
     }
 
     @Override
-    public void close() {
-        if (client == null) {
-            return;
+    public synchronized void close() {
+        RuntimeException failure = null;
+        if (client != null) {
+            try {
+                client.close();
+            } catch (RuntimeException exception) {
+                failure = exception;
+            } finally {
+                client = null;
+            }
         }
+        shutdown(httpExecutor);
+        shutdown(streamExecutor);
+        if (failure != null) throw failure;
+    }
+
+    private static ThreadFactory namedThreadFactory(String prefix) {
+        AtomicInteger number = new AtomicInteger(1);
+        return task -> new Thread(task, prefix + number.getAndIncrement());
+    }
+
+    private static void shutdown(ExecutorService executor) {
+        executor.shutdown();
         try {
-            client.close();
-        } finally {
-            client = null;
+            if (!executor.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException exception) {
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
         }
     }
 }
