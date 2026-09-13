@@ -18,47 +18,32 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
-/** Shared facilities and typed state for one randomized iteration. */
+/** Operation fixture and typed state; execution facilities belong to the scheduler. */
 public final class InputSpacePartitionTestContext {
     public static final InputSpacePartitionStateKey<Encoding> ENCODING =
             InputSpacePartitionStateKey.of("encoding", Encoding.class);
     public static final InputSpacePartitionStateKey<TestVerificationMode> VERIFICATION =
-            InputSpacePartitionStateKey.of(
-                    "verification", TestVerificationMode.class);
+            InputSpacePartitionStateKey.of("verification", TestVerificationMode.class);
     public static final InputSpacePartitionStateKey<Integer> PATH_DEPTH =
             InputSpacePartitionStateKey.of("path depth", Integer.class);
     public static final InputSpacePartitionStateKey<Boolean> TARGET_EXISTS =
             InputSpacePartitionStateKey.of("target exists", Boolean.class);
-    public static final InputSpacePartitionStateKey<OperationType> OPERATION =
-            InputSpacePartitionStateKey.of("operation", OperationType.class);
 
     private static final List<String> TEXT = List.of("", "plain ASCII text",
             "line one\nline two\n", "Unicode: café, 日本語, 🚀",
             "tabs\tand carriage returns\r\n");
     private static final int[] BINARY_LENGTHS = {0, 1, 16, 255};
-
-    private final Random random;
+    private final InputSpacePartitionExecution execution;
     private final Path directory;
-    private final InputSpacePartitionHierarchy coverage;
-    private final int iteration;
-    private final Map<InputSpacePartitionStateKey<?>, Object> state =
-            new IdentityHashMap<>();
+    private final Map<InputSpacePartitionStateKey<?>, Object> state = new IdentityHashMap<>();
 
-    public InputSpacePartitionTestContext(Random random, Path directory,
-            InputSpacePartitionHierarchy coverage, int iteration) {
-        this.random = Objects.requireNonNull(random, "random");
-        this.directory = Objects.requireNonNull(directory, "directory")
-                .toAbsolutePath().normalize();
-        this.coverage = Objects.requireNonNull(coverage, "coverage");
-        this.iteration = iteration;
-        if (!Files.isDirectory(this.directory) || iteration < 0) {
-            throw new IllegalArgumentException("Invalid test context");
-        }
+    public InputSpacePartitionTestContext(Path directory, InputSpacePartitionExecution execution) {
+        this.execution = Objects.requireNonNull(execution, "execution");
+        this.directory = Objects.requireNonNull(directory, "directory").toAbsolutePath().normalize();
+        if (!Files.isDirectory(this.directory)) throw new IllegalArgumentException("Invalid test directory");
     }
 
-    public Random random() { return random; }
-    public InputSpacePartitionHierarchy coverage() { return coverage; }
-    public int iteration() { return iteration; }
+    public int iteration() { return execution.iteration(); }
 
     public Path resolve(String path) {
         Path result = directory.resolve(path).normalize();
@@ -81,9 +66,9 @@ public final class InputSpacePartitionTestContext {
     }
 
     public byte[] randomPayload(Encoding encoding) {
+        Random random = execution.random();
         if (encoding == Encoding.UTF_8) {
-            return TEXT.get(random.nextInt(TEXT.size()))
-                    .getBytes(StandardCharsets.UTF_8);
+            return TEXT.get(random.nextInt(TEXT.size())).getBytes(StandardCharsets.UTF_8);
         }
         int choice = random.nextInt(BINARY_LENGTHS.length + 1);
         int length = choice < BINARY_LENGTHS.length
@@ -93,22 +78,10 @@ public final class InputSpacePartitionTestContext {
         return data;
     }
 
-    public JsonObject operation(OperationType type, String path,
-            Encoding encoding, byte[] data) throws Exception {
-        JsonObject operation = new JsonObject();
-        operation.addProperty("op", type.opcode());
-        if (path != null) operation.addProperty("path", path);
-        operation.addProperty("encoding", encoding.token());
-        operation.addProperty("data", encoding.encode(data));
-        require(VERIFICATION).apply(operation, data);
-        return operation;
-    }
-
-    public byte[] execute(JsonObject operation, Set<String> allowed)
-            throws Exception {
+    public byte[] execute(JsonObject operation, Set<String> allowed) throws Exception {
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         try (AICommandApplication application = application(output, directory)) {
-            application.executePrompt("[" + operation + "]", allowed);
+            application.executePrompt(TestJson.batch(operation), allowed);
         }
         return output.toByteArray();
     }
@@ -116,16 +89,16 @@ public final class InputSpacePartitionTestContext {
     public void testStdout() throws Exception {
         Encoding encoding = require(ENCODING);
         byte[] expected = randomPayload(encoding);
-        assertArrayEquals(expected, execute(
-                operation(OperationType.STDOUT, null, encoding, expected), Set.of()));
-        put(OPERATION, OperationType.STDOUT);
+        JsonObject operation = TestJson.operation(OperationType.STDOUT, null, encoding, expected);
+        require(VERIFICATION).apply(operation, expected);
+        assertArrayEquals(expected, execute(operation, Set.of()));
     }
 
     public void testFileWrite() throws Exception {
         String path = switch (require(PATH_DEPTH)) {
-            case 0 -> "result-" + iteration + ".dat";
-            case 1 -> "nested/result-" + iteration + ".dat";
-            case 2 -> "deeply/nested/result-" + iteration + ".dat";
+            case 0 -> "result-" + iteration() + ".dat";
+            case 1 -> "nested/result-" + iteration() + ".dat";
+            case 2 -> "deeply/nested/result-" + iteration() + ".dat";
             default -> throw new IllegalStateException("Unexpected path depth");
         };
         Path target = resolve(path);
@@ -137,10 +110,10 @@ public final class InputSpacePartitionTestContext {
         }
         Encoding encoding = require(ENCODING);
         byte[] expected = randomPayload(encoding);
-        execute(operation(OperationType.FILE_WRITE, path, encoding, expected),
-                Set.of(path));
+        JsonObject operation = TestJson.operation(OperationType.FILE_WRITE, path, encoding, expected);
+        require(VERIFICATION).apply(operation, expected);
+        execute(operation, Set.of(path));
         assertArrayEquals(expected, Files.readAllBytes(target));
-        put(OPERATION, OperationType.FILE_WRITE);
     }
 
     public void assertInputRejected(Path workingDirectory, String path) {
@@ -151,21 +124,17 @@ public final class InputSpacePartitionTestContext {
         }
     }
 
-    public void assertWriteRejected(Path workingDirectory, String path,
-            Encoding encoding) throws Exception {
-        JsonObject operation = operation(OperationType.FILE_WRITE, path,
+    public void assertWriteRejected(Path workingDirectory, String path, Encoding encoding) throws Exception {
+        JsonObject operation = TestJson.operation(OperationType.FILE_WRITE, path,
                 encoding, "replacement".getBytes(StandardCharsets.UTF_8));
         try (AICommandApplication application = application(
                 new ByteArrayOutputStream(), workingDirectory)) {
             assertThrows(IllegalArgumentException.class,
-                    () -> application.executePrompt(
-                            "[" + operation + "]", Set.of(path)));
+                    () -> application.executePrompt(TestJson.batch(operation), Set.of(path)));
         }
     }
 
-    private static AICommandApplication application(
-            OutputStream output, Path directory) {
-        return new AICommandApplication(
-                new LoopbackLLMProvider(), output, directory);
+    private static AICommandApplication application(OutputStream output, Path directory) {
+        return new AICommandApplication(new LoopbackLLMProvider(), output, directory);
     }
 }

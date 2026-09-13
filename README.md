@@ -21,7 +21,7 @@ mvn test
 You can run the program like this:
 
 ```
-echo "This is my prompt." | java -jar /home/robert/2026-09-04-ai/target/the-ai-command.jar file1.txt File2.java
+ai "This is my prompt." | java -jar /home/robert/2026-09-04-ai/target/the-ai-command.jar file1.txt File2.java
 ```
 
 #  Example 'ai' script, located at '~/roberts-ai/ai'

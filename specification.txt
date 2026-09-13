@@ -1,500 +1,133 @@
 # ChatGPT CLI Multi-Part I/O Protocol (CIOP) — Version 1.0
 
-## 1. Scope and goals
+## 1. Scope
 
-This document specifies **CIOP/1.0**, a byte-safe, low-ambiguity protocol for:
+CIOP/1.0 marshals stdin and files to a model and unmarshals a single JSON array of operations. Supported output operations print bytes, overwrite a writable file, or patch selected lines of a writable UTF-8 file.
 
-1) **Marshalling input** to the model as a sequence of sections representing:
-- stdin
-- zero or more files
+The protocol is byte-safe, length-delimited, verifiable, and extensible. Input files and output paths are relative to the application's working directory. Implementations must reject absolute paths, parent traversal, symlinks, and paths resolving outside that directory. Paths must not contain control characters or the header delimiter `---`.
 
-2) **Unmarshalling output** from the model as a **single JSON array** of “operations” that:
-- write to stdout, and/or
-- overwrite one or more provided files
+## 2. Input envelope
 
-### Goals
-- **Byte-safe** for arbitrary binary stdin and file contents.
-- **Unambiguous** parsing (no sentinel collisions with payload bytes).
-- **Verifiable**: recipient can confirm correct unmarshalling using length + SHA-256.
-- **Extensible**: add encodings, add opcodes later without breaking old parsers.
+The complete prompt begins with `---BEGIN CIOP/1.0---` and ends with `---END CIOP/1.0---`. No instructions are appended outside the envelope.
 
-### Non-goals
-- Streaming; this is a single-request / single-response envelope.
-- Partial file edits / patching (reserved for future opcodes).
+STDIN sections have this header:
 
----
+`---SECTION STDIN <encoding> <length> <sha256>---`
 
-## 2. Terminology
+FILE sections have this header:
 
-- **Section**: one input part (stdin or file).
-- **Payload**: the bytes of a section.
-- **Encoding** (input): how the payload is represented in the prompt text.
-- **Operation** (output): a JSON object describing an action (stdout print or file overwrite).
-- **SHA-256**: lowercase hex digest of the *raw bytes* of the payload (64 hex chars).
+`---SECTION FILE <encoding> <length> <sha256> access=<READ|READ_WRITE> path=<path>---`
 
----
+Encoding is `utf-8`, `base64`, or, for a nonexistent writable file, `missing`. Length and SHA-256 describe decoded raw bytes. A missing file has length zero, the SHA-256 of empty bytes, and an empty payload. FILE paths retain the exact spelling of their first included entry. The path is the last metadata field and extends to the closing header delimiter; spaces in filenames are allowed. Access is mandatory: READ means read-only; READ_WRITE permits file_write and file_patch, subject to their other rules. Never modify a READ file.
 
-## 3. Input prompt format (CIOP/1.0)
+Payload boundaries are determined by byte length, not by searching for marker text. UTF-8 lengths count encoded bytes, not characters. Base64 payload length is derived from the decoded byte length. A framing newline and `---END SECTION---` follow the payload. Marker-like text or non-text bytes may be transmitted using base64. Verify decoded bytes using the declared length and SHA-256.
 
-The input to the API `.input()` is **UTF‑8 text** that contains:
+The first FILE is always the built-in, READ-only virtual document `__ciop__/CIOP_PROTOCOL_INSTRUCTIONS.txt`: this protocol specification, packaged as an application resource. It is not a project file or a writable destination. The entire `__ciop__` namespace is reserved. Read and follow this document when producing the response.
 
-1) A fixed **envelope header**
-2) A sequence of **sections**
-3) Optional additional human instructions (outside the formal envelope) are allowed, but **strongly discouraged**; if present they must not alter the meaning of the section contents.
+The remaining order is context files, additional command-line files, then STDIN. The context configuration itself is not transmitted unless explicitly included.
 
-### 3.1 Envelope header
+### 2.1 Context configuration
 
-The prompt MUST start with:
+The optional `--context path` or `--context=path` argument loads a UTF-8 JSON document:
 
-```
----BEGIN CIOP/1.0---
-```
-
-and MUST end with:
-
-```
----END CIOP/1.0---
-```
-
-Everything between is part of the formal protocol.
-
-### 3.2 Sections
-
-Each section has:
-
-- A **section header line** with metadata
-- A **payload block** of exactly `length` bytes (after decoding according to `encoding`)
-- A **payload terminator line** that is safe because it is placed *after* reading exactly `length` bytes, not used to find boundaries.
-
-#### 3.2.1 Section header line
-
-Each section begins with a single ASCII line:
-
-```
----SECTION <source> <encoding> <length> <sha256> [<meta...>]---
-```
-
-Where:
-
-- `<source>` is one of:
-  - `STDIN`
-  - `FILE`
-- `<encoding>` is one of:
-  - `utf-8`
-  - `base64`
-- `<length>` is a non-negative base-10 integer:
-  - If `encoding=utf-8`: number of bytes of the UTF‑8 payload text.
-  - If `encoding=base64`: number of **raw decoded bytes** (not the base64 string length).
-- `<sha256>` is SHA‑256 of the **raw decoded bytes**, lowercase hex.
-- `[<meta...>]` is optional key/value metadata:
-  - For `FILE`, `path=<path>` is REQUIRED.
-  - For `STDIN`, no meta is required (meta MAY be present for future use).
-
-**Examples of header lines**
-- `---SECTION STDIN utf-8 12 e3b0...---` (example digest placeholder)
-- `---SECTION FILE base64 256 abcd... path=src/Main.bin---`
-
-#### 3.2.2 Payload block
-
-Immediately following the header line:
-
-- The payload representation begins on the next line.
-- The payload representation is:
-  - For `utf-8`: literal UTF‑8 text bytes of length `<length>` (this can include newlines).
-  - For `base64`: base64 text that decodes to exactly `<length>` bytes.
-- After the payload bytes (decoded), the sender writes a newline, then the terminator line.
-
-#### 3.2.3 Terminator line
-
-After the payload, the sender MUST include:
-
-```
----END SECTION---
-```
-
-**Important**: the parser MUST NOT search for this terminator to delimit payload. It exists only as a human/debugging aid. The payload boundary is determined by `<length>`.
-
-### 3.3 Verification rules (recipient/model side)
-
-For each section:
-1) Decode payload according to `<encoding>`.
-2) Verify:
-   - decoded byte length == `<length>`
-   - SHA-256(decoded bytes) == `<sha256>`
-3) If verification fails, the model SHOULD:
-   - produce a stdout operation describing the mismatch, and
-   - avoid destructive file writes unless explicitly safe.
-
-This provides the “certainty” check missing from the prior marker-based design.
-
-### 3.4 Encoding registry (extensible)
-
-CIOP maintains an encoding token registry. CIOP/1.0 defines:
-
-- `utf-8`: payload is raw UTF‑8 bytes (no transformation)
-- `base64`: payload is RFC 4648 base64 text representing raw bytes
-- `missing`: used in the case where a file is supplied as an argument, but the file is missing.  This allows for disambiguation between an empty 0 length file, and a non-existent file.
-
-Future versions MAY add: `utf-16le`, `iso-8859-1`, etc. Unknown encodings MUST be treated as an error by strict parsers; tolerant recipients MAY respond with an error operation to stdout.
-
----
-
-## 4. Output response format (operations JSON)
-
-The model response MUST be **exactly one JSON value**:
-- a top-level **array** of operation objects
-- with no leading/trailing commentary text
-
-### 4.1 Operation object common fields
-
-Each operation object MUST contain:
-
-- `"op"`: string opcode
-- `"encoding"`: string encoding of `"data"` (currently: `"utf-8"` or `"base64"`)
-- `"data"`: string payload in the specified encoding
-
-Optionally (recommended):
-- `"length"`: integer length in bytes of decoded data
-- `"sha256"`: lowercase hex digest of decoded data
-
-Including `length` and `sha256` makes output verifiable and aligns with input.
-
-### 4.2 Supported opcodes (CIOP/1.0)
-
-#### 4.2.1 `stdout`
-Print decoded `"data"` bytes to standard output.
-
-Required fields:
-- `"op": "stdout"`
-- `"encoding"`
-- `"data"`
-
-Optional:
-- `"length"`, `"sha256"`
-
-#### 4.2.2 `file_write`
-Overwrite the entire target file with decoded `"data"` bytes.
-
-Required fields:
-- `"op": "file_write"`
-- `"path"`: string path (MUST exactly match one of the provided FILE section `path=` values)
-- `"encoding"`
-- `"data"`
-
-Optional:
-- `"length"`, `"sha256"`
-
-NOTE:  In the implementation of the client that executes the op code for the 'file_write' operation, the client must be written in such a way that makes it impossible for the client to write to any file other than ones that were supplied to the program as arguments.  It should never be possible for the LLM to return output that would 'inject' data into arbitrary files in the filesystem that were not supplied as arguments.
-
-### 4.3 Ordering and multiplicity
-
-- The array MAY contain multiple operations.
-- The CLI SHOULD apply them **in array order**.
-- Multiple `stdout` operations are allowed (they concatenate in order).
-- Multiple `file_write` operations to the same path are allowed; last write wins (but discouraged).
-- If no `stdout` op is present, the CLI prints nothing.
-
-### 4.4 Output encoding rules
-
-- If output bytes are not valid UTF‑8 or may be binary, use `"encoding":"base64"`.
-- For `"utf-8"`, `"data"` is a JSON string containing Unicode; decoding to bytes uses UTF‑8.
-
----
-
-## 5. Error handling recommendations
-
-### 5.1 Input verification failure (model side)
-If any section fails length/hash verification, respond with:
-
-- a `stdout` operation describing which section failed and why
-- avoid `file_write` unless explicitly requested and safe
-
-### 5.2 Output verification failure (CLI side)
-If the CLI chooses to verify `"length"`/`"sha256"` (recommended when present):
-- If mismatch, abort file writes and print an error to stderr.
-
-(Verification fields are optional in CIOP/1.0, but recommended.)
-
----
-
-## 6. Examples (raw prompts and expected outputs)
-
-Notes for examples:
-- Hashes shown as `sha256:...` may be abbreviated with `…` for readability; in real traffic they are 64 hex chars.
-- Lengths must match the decoded bytes. In a real test suite, compute exact values; here they are illustrative but structurally correct.
-- Examples partition input space: utf-8 vs base64, zero files vs multiple, empty payloads, binary data, missing writes, multi-op stdout, etc.
-
----
-
-### Example 1 — stdin utf-8, no files, simple stdout
-**Raw input prompt**
-```
----BEGIN CIOP/1.0---
----SECTION STDIN utf-8 12 6f5902ac237024bdd0c176cb93063dc4---
-Hello world\n
----END SECTION---
----END CIOP/1.0---
-```
-
-**Expected output**
 ```json
-[
-  {"op":"stdout","encoding":"utf-8","data":"ACK\n"}
-]
+{
+  "files": [
+    {"README.md": "READ"},
+    {"src/example.txt": "READ_WRITE"}
+  ]
+}
 ```
 
----
+The only top-level field is the required `files` array. Each array entry contains exactly one filename and one explicit, case-sensitive access string: READ or READ_WRITE. Unknown access strings, nulls, malformed JSON, duplicate object members, and extra fields are errors. An empty context is `{"files":[]}`. Without --context, an empty context is used; there is no automatic context.json discovery.
 
-### Example 2 — stdin base64 (binary), stdout base64 (binary echo)
-**Raw input prompt**
-```
----BEGIN CIOP/1.0---
----SECTION STDIN base64 4 e2fc714c4727ee9395f324cd2e7f331f---
-AQIDBA==
----END SECTION---
----END CIOP/1.0---
-```
+Both the context filename and every listed filename resolve relative to the application's working directory, not the directory containing the context configuration. READ files must exist and be regular files. Missing READ_WRITE files are valid creation targets. Directories are not file entries. All paths undergo the same containment and no-symlink checks.
 
-**Expected output**
+Array order is preserved. Duplicate filesystem identities within context are errors, including normalized aliases such as `notes.txt` and `./notes.txt` and existing hard-link aliases. Command-line duplicates are sent only once and never upgrade a context permission. New command-line entries follow in argument order and default to READ_WRITE for compatibility. The first entry's transmitted path remains authoritative.
+
+## 3. Output
+
+The model response must be exactly one top-level JSON array, with no surrounding prose or Markdown fences. Operations are evaluated in array order.
+
+### 3.1 stdout
+
+`{"op":"stdout","encoding":"utf-8","data":"text"}`
+
+Required fields are `op`, `encoding`, and `data`. Encoding is `utf-8` or `base64`. Optional `length` and `sha256` fields verify decoded bytes.
+
+### 3.2 file_write
+
+`{"op":"file_write","path":"notes.txt","encoding":"utf-8","data":"replacement\n"}`
+
+This overwrites an entire file or creates a missing file. `path` must exactly match a READ_WRITE FILE section path. Required fields are `op`, `path`, `encoding`, and `data`. Optional `length` and `sha256` fields verify decoded bytes. Use base64 for binary or non-UTF-8 content.
+
+### 3.3 file_patch
+
+file_patch changes selected lines in an existing UTF-8 text file. Its JSON structure is intentionally explicit so models do not need to generate or escape unified-diff text.
+
+Example replacement:
+
 ```json
-[
-  {"op":"stdout","encoding":"base64","data":"AQIDBA=="}
-]
+{
+  "op": "file_patch",
+  "path": "notes.txt",
+  "source_sha256": "<64 lowercase hex characters>",
+  "hunks": [
+    {
+      "old_start": 2,
+      "old_count": 1,
+      "new_start": 2,
+      "new_count": 1,
+      "lines": [
+        {"type": "remove", "text": "old line"},
+        {"type": "add", "text": "new line"}
+      ]
+    }
+  ],
+  "result_sha256": "<optional hash of resulting UTF-8 bytes>",
+  "final_newline": true
+}
 ```
 
----
+Rules:
 
-### Example 3 — stdin utf-8 + one file utf-8, write file and print status
-**Raw input prompt**
-```
----BEGIN CIOP/1.0---
----SECTION STDIN utf-8 18 9c1185a5c5e9fc54612808977ee8f548---
-Update the file.\n
----END SECTION---
----SECTION FILE utf-8 6 e80b5017098950fc58aad83c8c14978e path=notes.txt---
-old\n
----END SECTION---
----END CIOP/1.0---
-```
+- `path` must exactly match a READ_WRITE FILE path and name a regular file existing in the staged file view.
+- `source_sha256` is required and must match that file's bytes when the operation is evaluated.
+- Line numbers are one-based.
+- Line `text` excludes `\n` and `\r` terminators.
+- A `context` line consumes one old line and produces the same new line.
+- A `remove` line consumes one old line and produces none.
+- An `add` line consumes no old line and produces one new line.
+- `old_count` equals the number of context plus remove lines.
+- `new_count` equals the number of context plus add lines.
+- Context and removed text must exactly match the source file.
+- Hunks must be ordered, non-overlapping, and within the source range.
+- `new_start` must identify the hunk's actual position in the progressively constructed result.
+- `result_sha256` is optional. When present, it must match the complete resulting bytes.
+- `final_newline` is optional and defaults to the source file's final-newline state.
+- UTF-8 patch results use `\n` line endings. Use file_write when exact preservation of other line endings is required.
+- Validation completes before replacement. Invalid hunks, stale hashes, unsafe paths, or result-hash mismatches reject the batch before destination changes.
 
-**Expected output**
-```json
-[
-  {"op":"stdout","encoding":"utf-8","data":"updated notes.txt\n"},
-  {"op":"file_write","path":"notes.txt","encoding":"utf-8","data":"new\n"}
-]
-```
+Insertion before line 2 uses old_start:2, old_count:0, new_start:2, new_count:1, with one add line. Deletion uses one or more remove lines and new_count:0. Multiple hunks are evaluated in order against the original file while the result is built.
 
----
+## 4. Ordering and safety
 
-### Example 4 — two files, only one overwritten, still valid protocol
-**Raw input prompt**
-```
----BEGIN CIOP/1.0---
----SECTION STDIN utf-8 15 3a7bd3e2360a3d29eea436fcfb7e44c7---
-Touch file A.\n
----END SECTION---
----SECTION FILE utf-8 2 9f9d51bc70ef21ca5c14f307980a29d8 path=a.txt---
-A
----END SECTION---
----SECTION FILE utf-8 2 7fc56270e7a70fa81a5935b72eacbe29 path=b.txt---
-B
----END SECTION---
----END CIOP/1.0---
-```
+A patch following a write or earlier patch observes the preceding staged result, so its source_sha256 must describe that state. Multiple stdout operations concatenate their bytes.
 
-**Expected output**
-```json
-[
-  {"op":"stdout","encoding":"utf-8","data":"wrote a.txt\n"},
-  {"op":"file_write","path":"a.txt","encoding":"utf-8","data":"A!\n"}
-]
-```
+Implementations enforce READ/READ_WRITE permissions, exact writable-path allowlisting, canonical containment, and no-symlink checks for both file_write and file_patch. Aliases must not bypass READ protection. Reserved protocol paths are never writable. File permissions are enforced by the application, independently of model compliance.
 
----
+### 4.1 Batch validation and recovery
 
-### Example 5 — file contains bytes identical to marker text; base64 removes ambiguity
-**Raw input prompt**
-```
----BEGIN CIOP/1.0---
----SECTION STDIN utf-8 26 5e2f3d0a0f2c0f6f1b0d9f1e1c2b3a4d---
-Check marker collisions.\n
----END SECTION---
----SECTION FILE base64 28 1b2m... path=weird.bin---
-LS0tRU5EIFNFQ1RJT04tLS0KLS0tQkVHSU4gQ0lPUC8xLjAtLS0=
----END SECTION---
----END CIOP/1.0---
-```
-(The decoded bytes literally contain strings like `---END SECTION---`.)
+The complete response is parsed and validated against an in-memory file view before destination files, directories, or stdout change. A file created by an earlier file_write can be patched later in the batch. Normalized aliases share staged content; distinct hard-linked destinations and conflicting file/directory destinations are rejected.
 
-**Expected output**
-```json
-[
-  {"op":"stdout","encoding":"utf-8","data":"parsed safely (length/hash delimited)\n"}
-]
-```
+Original bytes and file identities are rechecked before commit. Each destination receives its final staged bytes once. Existing files use sibling temporary replacement and atomic move where supported, preserving POSIX permission bits where supported; other metadata and hard-link relationships are not guaranteed to be preserved. Staging and recovery snapshots remain in memory. Ordinary commit failures trigger best-effort restoration of attempted destinations, deletion of newly created files, and removal of empty directories created by the batch. Recovery failures are reported individually. This is not crash-safe multi-file atomicity, and external concurrent modifications remain a race.
 
----
+Stdout is buffered in operation order and published only after successful file commits. An output failure reports that files were committed and stdout may be incomplete; it does not roll back committed files. Never automatically retry such a batch. Prompt and response logging remains independent of staging and may occur even when validation rejects the batch.
 
-### Example 6 — empty stdin payload (length 0), still valid
-**Raw input prompt**
-```
----BEGIN CIOP/1.0---
----SECTION STDIN utf-8 0 e3b0c44298fc1c149afbf4c8996fb924---
----END SECTION---
----END CIOP/1.0---
-```
+## 5. Verification failures
 
-**Expected output**
-```json
-[
-  {"op":"stdout","encoding":"utf-8","data":"no stdin content\n"}
-]
-```
+Input length or hash failures should produce a stdout operation explaining the mismatch and avoid unsafe writes. Output length, output hash, patch source hash, patch content, or patch result hash failures reject the complete batch during validation without destination-file or stdout effects.
 
----
+## 6. Guidance for models
 
-### Example 7 — file_write with base64 output (binary file)
-**Raw input prompt**
-```
----BEGIN CIOP/1.0---
----SECTION STDIN utf-8 23 a54d88e06612d820bc3be72877c74f257b561b19---
-Generate 3 bytes file.\n
----END SECTION---
----SECTION FILE utf-8 0 e3b0c44298fc1c149afbf4c8996fb924 path=out.bin---
----END SECTION---
----END CIOP/1.0---
-```
-
-**Expected output**
-```json
-[
-  {"op":"stdout","encoding":"utf-8","data":"writing out.bin (3 bytes)\n"},
-  {"op":"file_write","path":"out.bin","encoding":"base64","data":"AAEC"}
-]
-```
-
----
-
-### Example 8 — multiple stdout operations (ordering matters)
-**Raw input prompt**
-```
----BEGIN CIOP/1.0---
----SECTION STDIN utf-8 14 1dcca23355272056f04fe8bf20edfce0---
-Say hello.\n
----END SECTION---
----END CIOP/1.0---
-```
-
-**Expected output**
-```json
-[
-  {"op":"stdout","encoding":"utf-8","data":"Hello"},
-  {"op":"stdout","encoding":"utf-8","data":"\n"}
-]
-```
-
----
-
-### Example 9 — model declines to write files, only stdout explanation
-**Raw input prompt**
-```
----BEGIN CIOP/1.0---
----SECTION STDIN utf-8 33 7b502c3a1f48c8609ae212cdfb639dee---
-Do something unsafe to the file.\n
----END SECTION---
----SECTION FILE utf-8 11 64ec88ca00b268e5ba1a35678a1b5316 path=cfg.ini---
-enabled=1\n
----END SECTION---
----END CIOP/1.0---
-```
-
-**Expected output**
-```json
-[
-  {"op":"stdout","encoding":"utf-8","data":"Refusing to modify cfg.ini without clearer instruction.\n"}
-]
-```
-
----
-
-### Example 10 — verification failure case (hash mismatch) → stdout error only
-**Raw input prompt**
-```
----BEGIN CIOP/1.0---
----SECTION STDIN utf-8 5 0000000000000000000000000000000000000000000000000000000000000000---
-hello
----END SECTION---
----END CIOP/1.0---
-```
-
-**Expected output**
-```json
-[
-  {"op":"stdout","encoding":"utf-8","data":"Input verification failed for STDIN: sha256 mismatch.\n"}
-]
-```
-
----
-
-### Example 11 — two files, both overwritten, include optional length/sha256 in output
-**Raw input prompt**
-```
----BEGIN CIOP/1.0---
----SECTION STDIN utf-8 20 3c363836cf4e16666669a25da280a186---
-Normalize both files.\n
----END SECTION---
----SECTION FILE utf-8 4 0c7a623fd2bbc05b06423be359e4021d path=a.txt---
-A\r\n
----END SECTION---
----SECTION FILE utf-8 4 0c7a623fd2bbc05b06423be359e4021d path=b.txt---
-B\r\n
----END SECTION---
----END CIOP/1.0---
-```
-
-**Expected output**
-```json
-[
-  {"op":"stdout","encoding":"utf-8","data":"normalized\n","length":11,"sha256":"..."},
-  {"op":"file_write","path":"a.txt","encoding":"utf-8","data":"A\n","length":2,"sha256":"..."},
-  {"op":"file_write","path":"b.txt","encoding":"utf-8","data":"B\n","length":2,"sha256":"..."}
-]
-```
-
----
-
-### Example 12 — file path must match provided path exactly
-**Raw input prompt**
-```
----BEGIN CIOP/1.0---
----SECTION STDIN utf-8 28 0f343b0931126a20f133d67c2b018a3b---
-Write to the provided file.\n
----END SECTION---
----SECTION FILE utf-8 0 e3b0c44298fc1c149afbf4c8996fb924 path=dir/x.txt---
----END SECTION---
----END CIOP/1.0---
-```
-
-**Expected output**
-```json
-[
-  {"op":"stdout","encoding":"utf-8","data":"ok\n"},
-  {"op":"file_write","path":"dir/x.txt","encoding":"utf-8","data":"content\n"}
-]
-```
-
-(If the model attempted `"path":"./dir/x.txt"` instead, the CLI should reject or ignore it because it does not exactly match.)
-
----
-
-## 7. Summary of why this fixes the original flaws
-
-- **No marker collision ambiguity**: payload boundaries are determined by **byte length**, not sentinel searching; base64 is used for arbitrary bytes.
-- **Less brittle parsing**: headers are one line; payload is length-delimited; output is pure JSON.
-- **Verifiable unmarshalling**: SHA‑256 + length allow certainty checks.
-- **Extensible**: encoding registry and opcode `"op"` design support future additions (new encodings, new operations) without changing the core framing.
-
-If you want, I can also provide:
-- a machine-checkable ABNF-like grammar for the input envelope, and/or
-- a JSON Schema for the operations array (stdout/file_write) to lock down validation.
+Return only the JSON array. Use stdout for user-facing text. Use file_write for new files, binary files, or whole-file replacement. Use file_patch for a small line-oriented edit to an existing UTF-8 file. Copy context and removed lines exactly from the supplied FILE section. Keep hunks simple, ordered, and non-overlapping. Only READ_WRITE files may be changed, and output paths must exactly match their transmitted paths. The built-in protocol document is always READ-only.

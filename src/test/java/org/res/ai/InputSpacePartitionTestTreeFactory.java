@@ -1,169 +1,94 @@
 package org.res.ai;
 
-import java.util.LinkedHashMap;
+import java.nio.file.Path;
 import java.util.List;
-import java.util.Map;
 import java.util.function.Function;
+import org.res.ai.InputSpacePartitionTestNode.FixtureAction;
+
+import static org.res.ai.InputSpacePartitionTestContext.*;
+import static org.res.ai.InputSpacePartitionTestNode.*;
 
 /** Builds the executable operation and containment partition trees. */
 public final class InputSpacePartitionTestTreeFactory {
-    private final InputSpacePartitionTestNode operation;
-    private final InputSpacePartitionTestNode containment;
+    @FunctionalInterface
+    public interface PathCheck {
+        void execute(InputSpacePartitionTestContext context,
+                ContainmentTestFixture fixture, String path) throws Exception;
+    }
+
+    private final InputSpacePartitionTestNode<InputSpacePartitionTestContext> operation;
+    private final List<InputSpacePartitionTestNode<InputSpacePartitionTestContext>> containment;
 
     public InputSpacePartitionTestTreeFactory() {
-        operation = InputSpacePartitionTestNode.choice("operation",
-                InputSpacePartitionTestNode.sequence("stdout", context -> { },
-                        encoding(context -> context.testStdout())),
-                InputSpacePartitionTestNode.sequence("file_write", context -> { },
-                        encoding(context -> context.testFileWrite(),
-                                target(pathDepth(verification(
-                                        context -> context.testFileWrite()))))));
+        operation = fixtureChoice("operation", List.of(
+                fixtureSequence("stdout", (context, execution) -> { }, List.of(
+                        stateChoice("encoding", ENCODING, List.of(Encoding.values()), Encoding::token,
+                                verification((context, execution) -> context.testStdout())))),
+                fixtureSequence("file_write", (context, execution) -> { }, List.of(
+                        stateChoice("encoding", ENCODING, List.of(Encoding.values()), Encoding::token,
+                                stateChoice("target", TARGET_EXISTS, List.of(true, false),
+                                        exists -> exists ? "existing" : "missing",
+                                        stateChoice("path_depth", PATH_DEPTH, List.of(0, 1, 2), Object::toString,
+                                                verification((context, execution) -> context.testFileWrite())))))),
+                FilePatchOperationTestNode.create()));
 
-        containment = InputSpacePartitionTestNode.sequence("containment",
-                context -> { },
-                InputSpacePartitionTestNode.leaf(
-                        "input_traversal_rejected", context -> {
-                            ContainmentTestFixture fixture = context.require(
-                                    ContainmentTestFixture.KEY);
-                            int index = 0;
-                            for (String path : fixture.traversalPaths()) {
-                                if (index++ > 0) context.coverage().record(
-                                        "containment.input_traversal_rejected");
-                                context.assertInputRejected(
-                                        fixture.workingDirectory(), path);
-                            }
-                        }),
-                InputSpacePartitionTestNode.leaf(
-                        "output_traversal_rejected", context -> {
-                            ContainmentTestFixture fixture = context.require(
-                                    ContainmentTestFixture.KEY);
-                            int index = 0;
-                            for (String path : fixture.traversalPaths()) {
-                                if (index++ > 0) context.coverage().record(
-                                        "containment.output_traversal_rejected");
-                                context.assertWriteRejected(
-                                        fixture.workingDirectory(), path,
-                                        Encoding.UTF_8);
-                            }
-                            fixture.assertOutsideUnchanged();
-                        }),
-                InputSpacePartitionTestNode.leaf(
-                        "symlink_input_rejected", context -> {
-                            ContainmentTestFixture fixture = context.require(
-                                    ContainmentTestFixture.KEY);
-                            context.assertInputRejected(fixture.workingDirectory(),
-                                    fixture.existingSymlinkPath());
-                        }),
-                InputSpacePartitionTestNode.leaf(
-                        "symlink_existing_target_rejected", context -> {
-                            ContainmentTestFixture fixture = context.require(
-                                    ContainmentTestFixture.KEY);
-                            context.assertWriteRejected(fixture.workingDirectory(),
-                                    fixture.existingSymlinkPath(), Encoding.UTF_8);
-                            fixture.assertOutsideUnchanged();
-                        }),
-                InputSpacePartitionTestNode.leaf(
-                        "symlink_missing_target_rejected", context -> {
-                            ContainmentTestFixture fixture = context.require(
-                                    ContainmentTestFixture.KEY);
-                            context.assertWriteRejected(fixture.workingDirectory(),
-                                    fixture.missingSymlinkPath(), Encoding.BASE64);
-                            fixture.assertMissingTargetUncreated();
-                        }));
+        PathCheck input = (context, fixture, path) ->
+                context.assertInputRejected(fixture.workingDirectory(), path);
+        PathCheck utf8 = (context, fixture, path) ->
+                context.assertWriteRejected(fixture.workingDirectory(), path, Encoding.UTF_8);
+        containment = List.of(
+                containment("input_traversal_rejected", ContainmentTestFixture::traversalPaths, input),
+                containment("output_traversal_rejected", ContainmentTestFixture::traversalPaths, utf8),
+                containment("symlink_input_rejected", fixture -> List.of(fixture.existingSymlinkPath()), input),
+                containment("symlink_existing_target_rejected", fixture -> List.of(fixture.existingSymlinkPath()), utf8),
+                containment("symlink_missing_target_rejected", fixture -> List.of(fixture.missingSymlinkPath()),
+                        (context, fixture, path) -> context.assertWriteRejected(
+                                fixture.workingDirectory(), path, Encoding.BASE64)));
     }
 
-    public List<InputSpacePartitionNode> partitionRoots() {
-        return List.of(operation.toPartitionNode(), containment.toPartitionNode());
+    private static InputSpacePartitionTestNode<InputSpacePartitionTestContext> containment(String name,
+            Function<ContainmentTestFixture, List<String>> paths, PathCheck check) {
+        return fixtureLeaf(name, (context, execution) -> {
+            ContainmentTestFixture fixture = new ContainmentTestFixture(context);
+            for (String path : paths.apply(fixture)) {
+                check.execute(context, fixture, path);
+                fixture.assertOutsideUnchanged();
+                fixture.assertMissingTargetUncreated();
+            }
+        });
     }
 
-    public OperationType executeRandomOperation(
-            InputSpacePartitionTestContext context) throws Exception {
-        operation.execute(context);
-        return context.require(InputSpacePartitionTestContext.OPERATION);
+    public InputSpacePartitionTestSpace<InputSpacePartitionTestContext> operationSpace(Path parent) {
+        org.junit.jupiter.api.Assertions.assertEquals(List.of(OperationType.values()).stream()
+                        .map(OperationType::opcode).toList(),
+                operation.children().stream().map(InputSpacePartitionTestNode::name).toList());
+        return space("operations", parent, List.of(operation));
     }
 
-    public void executeContainmentTests(
-            InputSpacePartitionTestContext context) throws Exception {
-        context.put(InputSpacePartitionTestContext.VERIFICATION,
-                TestVerificationMode.NONE);
-        context.put(ContainmentTestFixture.KEY,
-                new ContainmentTestFixture(context));
-        containment.execute(context);
+    public InputSpacePartitionTestSpace<InputSpacePartitionTestContext> containmentSpace(Path parent) {
+        return space("containment", parent, containment);
     }
 
-    private static InputSpacePartitionTestNode encoding(
-            InputSpacePartitionTestNode.Action terminal) {
-        return encoding(terminal, null);
+    private static InputSpacePartitionTestSpace<InputSpacePartitionTestContext> space(String name,
+            Path parent, List<InputSpacePartitionTestNode<InputSpacePartitionTestContext>> roots) {
+        return InputSpacePartitionTestSpace.inDirectory(name, parent, roots,
+                InputSpacePartitionTestContext::new, context -> context.resolve("."));
     }
 
-    private static InputSpacePartitionTestNode encoding(
-            InputSpacePartitionTestNode.Action terminal,
-            InputSpacePartitionTestNode continuation) {
-        return nestedChoice("encoding", InputSpacePartitionTestContext.ENCODING,
-                enumChoices(Encoding.values(), Encoding::token), value ->
-                        continuation == null ? verification(terminal) : continuation);
+    private static InputSpacePartitionTestNode<InputSpacePartitionTestContext> verification(
+            FixtureAction<InputSpacePartitionTestContext> terminal) {
+        return fixtureValues("verification", List.of(TestVerificationMode.values()),
+                TestVerificationMode::partitionName, value -> (context, execution) -> {
+                    context.put(VERIFICATION, value);
+                    terminal.execute(context, execution);
+                }, List.of());
     }
 
-    private static InputSpacePartitionTestNode target(
-            InputSpacePartitionTestNode continuation) {
-        return nestedChoice("target",
-                InputSpacePartitionTestContext.TARGET_EXISTS,
-                ordered("existing", true, "missing", false),
-                value -> continuation);
-    }
-
-    private static InputSpacePartitionTestNode pathDepth(
-            InputSpacePartitionTestNode continuation) {
-        return nestedChoice("path_depth", InputSpacePartitionTestContext.PATH_DEPTH,
-                ordered("0", 0, "1", 1, "2", 2), value -> continuation);
-    }
-
-    private static InputSpacePartitionTestNode verification(
-            InputSpacePartitionTestNode.Action terminal) {
-        Map<String, TestVerificationMode> choices = enumChoices(
-                TestVerificationMode.values(), TestVerificationMode::partitionName);
-        return InputSpacePartitionTestNode.choice("verification",
-                choices.entrySet().stream().map(entry ->
-                        InputSpacePartitionTestNode.leaf(entry.getKey(), context -> {
-                            context.put(InputSpacePartitionTestContext.VERIFICATION,
-                                    entry.getValue());
-                            terminal.execute(context);
-                        })).toArray(InputSpacePartitionTestNode[]::new));
-    }
-
-    private static <T> InputSpacePartitionTestNode nestedChoice(String name,
-            InputSpacePartitionStateKey<T> key, Map<String, T> choices,
-            Function<T, InputSpacePartitionTestNode> continuation) {
-        return InputSpacePartitionTestNode.choice(name,
-                choices.entrySet().stream().map(entry ->
-                        InputSpacePartitionTestNode.sequence(entry.getKey(),
-                                context -> context.put(key, entry.getValue()),
-                                continuation.apply(entry.getValue())))
-                        .toArray(InputSpacePartitionTestNode[]::new));
-    }
-
-    private interface Name<T> {
-        String get(T value);
-    }
-
-    private static <T> Map<String, T> enumChoices(T[] values, Name<T> naming) {
-        Map<String, T> choices = new LinkedHashMap<>();
-        for (T value : values) choices.put(naming.get(value), value);
-        return choices;
-    }
-
-    private static <T> Map<String, T> ordered(
-            String firstName, T first, String secondName, T second) {
-        Map<String, T> result = new LinkedHashMap<>();
-        result.put(firstName, first);
-        result.put(secondName, second);
-        return result;
-    }
-
-    private static <T> Map<String, T> ordered(String firstName, T first,
-            String secondName, T second, String thirdName, T third) {
-        Map<String, T> result = ordered(firstName, first, secondName, second);
-        result.put(thirdName, third);
-        return result;
+    /** Typed operation state remains local to this factory; value branching is generic. */
+    private static <T> InputSpacePartitionTestNode<InputSpacePartitionTestContext> stateChoice(
+            String name, InputSpacePartitionStateKey<T> key, List<T> values, Function<T, String> naming,
+            InputSpacePartitionTestNode<InputSpacePartitionTestContext> continuation) {
+        return fixtureValues(name, values, naming,
+                value -> (context, execution) -> context.put(key, value), List.of(continuation));
     }
 }

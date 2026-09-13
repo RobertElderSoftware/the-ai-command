@@ -6,120 +6,60 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Random;
-import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** Counts selections in a declared input-space partition tree. */
+/** Counts full leaf paths independently; branch totals sum their descendants. */
 public final class InputSpacePartitionHierarchy {
-    private static final Set<String> HIDDEN_DIMENSIONS = Set.of(
-            "encoding", "target", "path_depth", "verification");
-
     private final Map<String, Integer> counts = new LinkedHashMap<>();
-    private final Map<String, List<String>> children = new LinkedHashMap<>();
+    private final List<InputSpacePartitionNode> roots;
 
-    public InputSpacePartitionHierarchy(
-            Collection<InputSpacePartitionNode> roots) {
-        List<InputSpacePartitionNode> rootList = List.copyOf(
-                Objects.requireNonNull(roots, "roots"));
-        children.put("", names(rootList, ""));
-        for (InputSpacePartitionNode root : rootList) initialize(root, "");
+    public InputSpacePartitionHierarchy(Collection<InputSpacePartitionNode> roots) {
+        this.roots = InputSpacePartitionNode.validateChildren(
+                List.copyOf(Objects.requireNonNull(roots, "roots")), InputSpacePartitionNode::name);
+        for (InputSpacePartitionNode node : this.roots) initialize(node, "");
     }
 
-    public String select(Random random, String category) {
-        List<String> choices = children.get(category);
-        if (choices == null || choices.isEmpty()) {
-            throw new IllegalArgumentException(
-                    "Category has no children: " + category);
-        }
-        String selected = choices.get(random.nextInt(choices.size()));
-        record(selected);
-        return segment(selected);
+    public void record(String path) {
+        if (!counts.containsKey(path))
+            throw new IllegalArgumentException("Not a declared leaf: " + path);
+        counts.merge(path, 1, Integer::sum);
     }
 
-    public void record(String category) {
-        if (!counts.containsKey(category)) {
-            throw new IllegalArgumentException(
-                    "Category is not declared: " + category);
-        }
-        counts.merge(category, 1, Integer::sum);
-    }
+    public int count(String path) { return counts.getOrDefault(path, 0); }
 
-    public int count(String category) {
-        return counts.getOrDefault(category, 0);
-    }
-
-    public int total(String category) {
-        int directCount = count(category);
-        if (directCount > 0) return directCount;
-        return children.getOrDefault(category, List.of()).stream()
-                .mapToInt(this::total).sum();
+    public int total(String path) {
+        String prefix = path.isEmpty() ? "" : path + ".";
+        return counts.entrySet().stream()
+                .filter(entry -> entry.getKey().equals(path) || entry.getKey().startsWith(prefix))
+                .mapToInt(Map.Entry::getValue).sum();
     }
 
     public void assertAllLeavesRecorded() {
-        Map<String, Integer> leafValueCounts = new LinkedHashMap<>();
-        counts.forEach((category, count) -> {
-            if (children.getOrDefault(category, List.of()).isEmpty()) {
-                leafValueCounts.merge(segment(category), count, Integer::sum);
-            }
-        });
-        leafValueCounts.forEach((leaf, count) -> assertTrue(count > 0,
-                () -> "Input-space partition was not exercised: " + leaf));
+        List<String> missing = counts.keySet().stream().filter(path -> count(path) == 0).toList();
+        assertTrue(missing.isEmpty(), () -> "Input-space partitions were not exercised: " + missing);
     }
 
-    public void printSummary(PrintStream output) {
-        output.println("Total Tests Run: " + total("operation"));
-        List<String> branches = children.getOrDefault("operation", List.of());
-        for (int index = 0; index < branches.size(); index++) {
-            printBranch(output, branches.get(index), "",
-                    index == branches.size() - 1);
-        }
-    }
+    public void printPaths(PrintStream output) { printBranches(output, roots, "", ""); }
 
     private void initialize(InputSpacePartitionNode node, String parent) {
         String path = qualify(parent, node.name());
-        if (counts.putIfAbsent(path, 0) != null) {
-            throw new IllegalArgumentException("Duplicate category: " + path);
-        }
-        children.put(path, names(node.children(), path));
+        if (node.isLeaf()) counts.put(path, 0);
         for (InputSpacePartitionNode child : node.children()) initialize(child, path);
     }
 
-    private void printBranch(PrintStream output, String category,
-            String prefix, boolean last) {
-        String connector = last ? "└─" : "├─";
-        output.println(prefix + connector + segment(category) + ": "
-                + total(category));
-        String childPrefix = prefix + (last ? "  " : "│ ");
-        printChildren(output, category, childPrefix);
-    }
-
-    private void printChildren(PrintStream output, String category,
-            String prefix) {
-        List<String> descendants = children.getOrDefault(category, List.of());
-        if (descendants.size() == 1
-                && HIDDEN_DIMENSIONS.contains(segment(descendants.get(0)))) {
-            printChildren(output, descendants.get(0), prefix);
-            return;
+    private void printBranches(PrintStream output, List<InputSpacePartitionNode> branches,
+            String parent, String prefix) {
+        for (int index = 0; index < branches.size(); index++) {
+            InputSpacePartitionNode node = branches.get(index);
+            String path = qualify(parent, node.name());
+            boolean last = index == branches.size() - 1;
+            output.println(prefix + (last ? "└─" : "├─") + node.name() + ": " + total(path));
+            printBranches(output, node.children(), path, prefix + (last ? "  " : "│ "));
         }
-        for (int index = 0; index < descendants.size(); index++) {
-            printBranch(output, descendants.get(index), prefix,
-                    index == descendants.size() - 1);
-        }
-    }
-
-    private static List<String> names(
-            List<InputSpacePartitionNode> nodes, String parent) {
-        return nodes.stream().map(node -> qualify(parent, node.name())).toList();
     }
 
     private static String qualify(String parent, String child) {
         return parent.isEmpty() ? child : parent + "." + child;
-    }
-
-    private static String segment(String category) {
-        int dot = category.lastIndexOf('.');
-        return dot < 0 ? category : category.substring(dot + 1);
     }
 }

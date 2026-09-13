@@ -3,7 +3,8 @@ package org.res.ai;
 /** Enumerates the operation codes understood by the application. */
 public enum OperationType {
     STDOUT("stdout"),
-    FILE_WRITE("file_write");
+    FILE_WRITE("file_write"),
+    FILE_PATCH("file_patch");
 
     private final String opcode;
 

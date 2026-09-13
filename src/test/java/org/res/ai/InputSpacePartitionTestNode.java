@@ -1,113 +1,92 @@
 package org.res.ai;
 
-import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
+import java.util.function.Function;
 
-/** Executable node whose structure is also used as coverage metadata. */
-public final class InputSpacePartitionTestNode {
+/** Executable tree parameterized by its component fixture. */
+public final class InputSpacePartitionTestNode<F> {
+    /** A fixture action that does not need execution facilities. */
     @FunctionalInterface
-    public interface Action {
-        void execute(InputSpacePartitionTestContext context) throws Exception;
+    public interface ExceptionConsumer<T> {
+        void accept(T value) throws Exception;
+    }
+
+    @FunctionalInterface
+    public interface FixtureAction<F> {
+        void execute(F fixture, InputSpacePartitionExecution execution) throws Exception;
     }
 
     private final String name;
-    private final List<InputSpacePartitionTestNode> children;
-    private final Action action;
+    private final List<InputSpacePartitionTestNode<F>> children;
+    private final FixtureAction<F> action;
     private final boolean choice;
 
-    private InputSpacePartitionTestNode(String name,
-            List<InputSpacePartitionTestNode> children, Action action,
-            boolean choice) {
-        this.name = validateName(name);
-        this.children = List.copyOf(Objects.requireNonNull(children, "children"));
+    private InputSpacePartitionTestNode(String name, List<InputSpacePartitionTestNode<F>> children,
+            FixtureAction<F> action, boolean choice) {
+        this.name = InputSpacePartitionNode.validateName(name);
+        this.children = InputSpacePartitionNode.validateChildren(children, InputSpacePartitionTestNode::name);
         this.action = Objects.requireNonNull(action, "action");
         this.choice = choice;
-        Set<String> names = new LinkedHashSet<>();
-        for (InputSpacePartitionTestNode child : this.children) {
-            if (!names.add(child.name)) {
-                throw new IllegalArgumentException("Duplicate child: " + child.name);
-            }
-        }
-        if (choice && this.children.isEmpty()) {
+        if (choice && this.children.isEmpty())
             throw new IllegalArgumentException("A choice node requires children");
-        }
     }
 
-    public static InputSpacePartitionTestNode leaf(String name, Action action) {
-        return new InputSpacePartitionTestNode(name, List.of(), action, false);
+    public static <F> InputSpacePartitionTestNode<F> fixtureLeaf(String name, FixtureAction<F> action) {
+        return new InputSpacePartitionTestNode<>(name, List.of(), action, false);
     }
 
-    public static InputSpacePartitionTestNode choice(String name,
-            InputSpacePartitionTestNode... children) {
-        return new InputSpacePartitionTestNode(
-                name, List.of(children), context -> { }, true);
+    /** Adapts fixture-only actions without wrapping their exceptions or assertion errors. */
+    public static <F> InputSpacePartitionTestNode<F> fixtureLeaf(String name, ExceptionConsumer<F> action) {
+        Objects.requireNonNull(action, "action");
+        return fixtureLeaf(name, (fixture, execution) -> action.accept(fixture));
     }
 
-    public static InputSpacePartitionTestNode sequence(String name, Action action,
-            InputSpacePartitionTestNode... children) {
-        return new InputSpacePartitionTestNode(
-                name, List.of(children), action, false);
+    public static <F> InputSpacePartitionTestNode<F> fixtureChoice(
+            String name, List<InputSpacePartitionTestNode<F>> children) {
+        return new InputSpacePartitionTestNode<>(name, children, (fixture, execution) -> { }, true);
     }
 
-    public static <T> InputSpacePartitionTestNode stateChoice(String name,
-            InputSpacePartitionStateKey<T> key, Map<String, T> choices) {
-        return choice(name, choices.entrySet().stream()
-                .map(entry -> leaf(entry.getKey(),
-                        context -> context.put(key, entry.getValue())))
-                .toArray(InputSpacePartitionTestNode[]::new));
+    public static <F> InputSpacePartitionTestNode<F> fixtureSequence(String name,
+            FixtureAction<F> action, List<InputSpacePartitionTestNode<F>> children) {
+        return new InputSpacePartitionTestNode<>(name, children, action, false);
     }
 
-    public String name() {
-        return name;
+    /** Each value supplies an action followed by the shared continuation, if any. */
+    public static <F, T> InputSpacePartitionTestNode<F> fixtureValues(String name,
+            List<T> values, Function<T, String> naming,
+            Function<T, FixtureAction<F>> actions, List<InputSpacePartitionTestNode<F>> continuation) {
+        return fixtureChoice(name, List.copyOf(values).stream().map(value ->
+                fixtureSequence(naming.apply(value), actions.apply(value), continuation)).toList());
     }
 
-    public List<InputSpacePartitionTestNode> children() {
-        return children;
+    public String name() { return name; }
+    public List<InputSpacePartitionTestNode<F>> children() { return children; }
+    public boolean isLeaf() { return children.isEmpty(); }
+
+    public void execute(F fixture, InputSpacePartitionExecution execution) throws Exception {
+        execute(fixture, execution, name);
     }
 
-    public boolean isLeaf() {
-        return children.isEmpty();
-    }
-
-    public void execute(InputSpacePartitionTestContext context) throws Exception {
-        execute(context, name);
-    }
-
-    public void execute(InputSpacePartitionTestContext context, String path)
-            throws Exception {
-        Objects.requireNonNull(context, "context");
-        if (isLeaf()) {
-            action.execute(context);
-        } else if (choice) {
-            String selected = context.coverage().select(context.random(), path);
-            InputSpacePartitionTestNode child = children.stream()
-                    .filter(candidate -> candidate.name.equals(selected))
-                    .findFirst().orElseThrow();
-            child.execute(context, path + "." + selected);
+    private void execute(F fixture, InputSpacePartitionExecution execution, String path) throws Exception {
+        Objects.requireNonNull(fixture, "fixture");
+        Objects.requireNonNull(execution, "execution").enter(path);
+        if (choice) {
+            InputSpacePartitionTestNode<F> child = children.get(execution.random().nextInt(children.size()));
+            child.execute(fixture, execution, path + "." + child.name);
         } else {
-            action.execute(context);
-            for (InputSpacePartitionTestNode child : children) {
-                String childPath = path + "." + child.name;
-                if (child.isLeaf()) context.coverage().record(childPath);
-                child.execute(context, childPath);
+            action.execute(fixture, execution);
+            for (InputSpacePartitionTestNode<F> child : children)
+                child.execute(fixture, execution, path + "." + child.name);
+            if (isLeaf()) {
+                execution.coverage().record(path);
+                execution.complete(path);
             }
         }
     }
 
     public InputSpacePartitionNode toPartitionNode() {
-        return new InputSpacePartitionNode(name, children.stream()
-                .map(InputSpacePartitionTestNode::toPartitionNode).toList());
-    }
-
-    private static String validateName(String name) {
-        String value = Objects.requireNonNull(name, "name");
-        if (value.isBlank() || value.indexOf('.') >= 0) {
-            throw new IllegalArgumentException(
-                    "Partition name must be one nonblank segment: " + value);
-        }
-        return value;
+        return new InputSpacePartitionNode(name,
+                children.stream().map(InputSpacePartitionTestNode::toPartitionNode).toList());
     }
 }

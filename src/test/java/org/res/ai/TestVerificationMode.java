@@ -2,9 +2,6 @@ package org.res.ai;
 
 import com.google.gson.JsonObject;
 
-import java.security.MessageDigest;
-import java.util.HexFormat;
-
 /** Optional verification fields included in a generated operation. */
 public enum TestVerificationMode {
     NONE,
@@ -21,8 +18,7 @@ public enum TestVerificationMode {
             operation.addProperty("length", data.length);
         }
         if (this == SHA256_ONLY || this == LENGTH_AND_SHA256) {
-            operation.addProperty("sha256", HexFormat.of().formatHex(
-                    MessageDigest.getInstance("SHA-256").digest(data)));
+            operation.addProperty("sha256", AICommandApplication.sha256(data));
         }
     }
 }
