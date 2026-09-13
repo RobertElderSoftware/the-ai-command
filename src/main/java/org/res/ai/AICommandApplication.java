@@ -15,7 +15,6 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
-import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
@@ -70,28 +69,88 @@ public class AICommandApplication implements AutoCloseable {
     }
 
     public void run(byte[] stdin, List<String> inputPaths, RequestContext context) throws IOException {
-        List<ContextFile> files = Objects.requireNonNull(context, "context")
-                .merge(new WorkingDirectoryPaths(workingDirectory), inputPaths);
+        run(stdin, inputPaths, context, null);
+    }
+
+    /** CLI entry: persist stdin before loading context or contacting the provider. */
+    public void runWithHistory(byte[] stdin, List<String> inputPaths, String contextFilename) throws IOException {
+        runWithHistory(stdin, inputPaths, contextFilename, false);
+    }
+
+    /** Recording requires an existing history directory and can be explicitly disabled. */
+    public void runWithHistory(byte[] stdin, List<String> inputPaths, String contextFilename,
+            boolean disableConversationHistory) throws IOException {
+        ConversationHistory history = new ConversationHistory(workingDirectory, contextFilename,
+                !disableConversationHistory);
+        byte[] input = stdin == null ? new byte[0] : stdin;
+        try {
+            history.input(input);
+            RequestContext context = Files.notExists(resolve(history.contextFilename()), NO_FOLLOW)
+                    ? RequestContext.empty()
+                    : RequestContext.load(workingDirectory, history.contextFilename());
+            run(input, inputPaths, context, history);
+        } catch (IOException | RuntimeException failure) {
+            //I manually commented out this history logging statement because when codex
+            //fails from an API quota failure, it will echo back the entire context that was
+            //passed into it, and if that gets logged into the conversation history file it
+            //will MASSIVELY increase the size of the conversation history file which will
+            //then get sent back on EVERY SINGLE FUTURE REQUEST, and this will completly 
+            //blow through my entire API usage quota very fast.  TODO:  Think of a better
+            //conversation history logging item for this case.
+            //try {
+            //    history.failed(failure);
+            //} catch (IOException | RuntimeException recordingFailure) {
+            //    failure.addSuppressed(recordingFailure);
+            //}
+            throw failure;
+        }
+    }
+
+    private void run(byte[] stdin, List<String> inputPaths, RequestContext context,
+            ConversationHistory history) throws IOException {
+        List<ContextFile> files = new ArrayList<>(Objects.requireNonNull(context, "context")
+                .merge(new WorkingDirectoryPaths(workingDirectory), inputPaths));
         Set<String> writable = new HashSet<>();
         Set<String> readOnly = new HashSet<>();
-        for (ContextFile file : files)
+        for (int index = 0; index < files.size(); index++) {
+            ContextFile file = files.get(index);
+            if (history != null && history.protects(resolve(file.path()))) {
+                file = new ContextFile(file.path(), FileAccess.READ);
+                files.set(index, file);
+            }
             (file.access() == FileAccess.READ_WRITE ? writable : readOnly).add(file.path());
-        executePrompt(buildPrompt(stdin == null ? new byte[0] : stdin, files), writable, readOnly);
+        }
+        if (history != null) {
+            readOnly.add(ConversationHistory.DIRECTORY);
+            readOnly.add(history.contextFilename());
+        }
+        executePrompt(buildPrompt(stdin == null ? new byte[0] : stdin, files), writable, readOnly, history);
     }
 
     public void executePrompt(String prompt, Set<String> allowedFilePaths) throws IOException {
-        executePrompt(prompt, allowedFilePaths, Set.of());
+        executePrompt(prompt, allowedFilePaths, Set.of(), null);
     }
 
     private void executePrompt(String prompt, Set<String> allowedFilePaths,
-            Set<String> readOnlyPaths) throws IOException {
+            Set<String> readOnlyPaths, ConversationHistory history) throws IOException {
         String value = Objects.requireNonNull(prompt, "prompt");
         log("prompt.txt", value);
         provider.initialize();
+        if (history != null) history.sent();
         String response = provider.complete(value);
         log("response.txt", response);
-        applyOperations(parseOperations(response),
+        if (history != null) history.received();
+        byte[] published = applyOperations(parseOperations(response),
                 allowedFilePaths == null ? Set.of() : Set.copyOf(allowedFilePaths), readOnlyPaths);
+        if (history != null) {
+            try {
+                if (published.length > 0) history.output(published);
+                history.applied();
+            } catch (IOException | RuntimeException failure) {
+                throw new IOException("Operations completed; recording the history completion event failed. "
+                        + "Do not retry the batch automatically.", failure);
+            }
+        }
     }
 
     private void log(String suffix, String text) {
@@ -132,7 +191,7 @@ public class AICommandApplication implements AutoCloseable {
                 + payload + "\n" + END_SECTION + "\n";
     }
 
-    private void applyOperations(List<Operation> operations, Set<String> allowedPaths,
+    private byte[] applyOperations(List<Operation> operations, Set<String> allowedPaths,
             Set<String> readOnlyPaths) throws IOException {
         java.util.Map<Path, byte[]> originals = new java.util.LinkedHashMap<>();
         java.util.Map<Path, byte[]> staged = new java.util.LinkedHashMap<>();
@@ -189,6 +248,13 @@ public class AICommandApplication implements AutoCloseable {
                 throw new IllegalArgumentException(message, exception);
             }
         }
+        commitBatch(staged, originals, identities, readOnlyPaths);
+        return publishOutput(output);
+    }
+
+    private void commitBatch(java.util.Map<Path, byte[]> staged,
+            java.util.Map<Path, byte[]> originals,
+            java.util.Map<Path, Object> identities, Set<String> readOnlyPaths) throws IOException {
         // Recheck the entire snapshot before the first filesystem mutation.
         for (Path target : staged.keySet()) {
             requireWritable(target, readOnlyPaths);
@@ -229,6 +295,9 @@ public class AICommandApplication implements AutoCloseable {
             recoveryFailures.forEach(exception::addSuppressed);
             throw exception;
         }
+    }
+
+    private byte[] publishOutput(java.io.ByteArrayOutputStream output) throws IOException {
         try {
             output.writeTo(stdout);
             stdout.flush();
@@ -237,6 +306,7 @@ public class AICommandApplication implements AutoCloseable {
         } catch (IOException | RuntimeException exception) {
             throw new IOException("Files committed; stdout publication failed and may be incomplete. Do not retry the batch automatically.", exception);
         }
+        return output.toByteArray();
     }
 
     private String relative(Path target) {

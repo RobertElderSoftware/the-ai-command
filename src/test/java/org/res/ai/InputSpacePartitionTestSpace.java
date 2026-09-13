@@ -68,8 +68,8 @@ public final class InputSpacePartitionTestSpace<F> {
 
     public InputSpacePartitionTestSpace(String name, List<InputSpacePartitionTestNode<F>> scenarios,
             Factory<F> factory, Cleanup<F> cleanup) {
-        this.name = InputSpacePartitionNode.validateName(name);
-        this.scenarios = InputSpacePartitionNode.validateChildren(scenarios, InputSpacePartitionTestNode::name);
+        this.name = InputSpacePartitionTestNode.validateName(name);
+        this.scenarios = InputSpacePartitionTestNode.validateChildren(scenarios, InputSpacePartitionTestNode::name);
         if (this.scenarios.isEmpty()) throw new IllegalArgumentException("A space needs scenarios");
         this.factory = Objects.requireNonNull(factory, "factory");
         this.cleanup = Objects.requireNonNull(cleanup, "cleanup");
@@ -79,8 +79,7 @@ public final class InputSpacePartitionTestSpace<F> {
     public List<InputSpacePartitionTestNode<F>> scenarios() { return scenarios; }
 
     InputSpacePartitionHierarchy newCoverage() {
-        return new InputSpacePartitionHierarchy(scenarios.stream()
-                .map(InputSpacePartitionTestNode::toPartitionNode).toList());
+        return new InputSpacePartitionHierarchy(scenarios);
     }
 
     void execute(int scenario, InputSpacePartitionExecution execution) throws Exception {

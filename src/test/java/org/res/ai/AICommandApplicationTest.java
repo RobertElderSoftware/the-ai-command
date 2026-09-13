@@ -43,7 +43,7 @@ class AICommandApplicationTest {
 
     @Test
     void registeredApplicationScenariosAreProcessedCorrectly() {
-        var spaces = InputSpacePartitionTestRegistry.applicationSpaces(temporaryDirectory).spaces();
+        var spaces = InputSpacePartitionTestTreeFactory.applicationSpaces(temporaryDirectory);
         var coverage = spaces.stream().map(InputSpacePartitionTestSpace::newCoverage).toList();
         Random random = new Random(SEED);
         int[] executions = new int[spaces.size()];

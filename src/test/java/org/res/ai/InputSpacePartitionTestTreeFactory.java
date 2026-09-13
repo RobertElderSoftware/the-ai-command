@@ -10,6 +10,24 @@ import static org.res.ai.InputSpacePartitionTestNode.*;
 
 /** Builds the executable operation and containment partition trees. */
 public final class InputSpacePartitionTestTreeFactory {
+    public static List<InputSpacePartitionTestSpace<?>> applicationSpaces(Path parent) {
+        InputSpacePartitionTestTreeFactory operations = new InputSpacePartitionTestTreeFactory();
+        return validateSpaces(List.of(
+                operations.operationSpace(parent), operations.containmentSpace(parent),
+                BatchTestFixture.space(parent), new RequestContextTest().space(parent),
+                ConversationHistoryTest.space(parent),
+                AICommandApplicationTest.loggingSpace(parent),
+                AICommandApplicationTest.patchRegressionSpace(parent)));
+    }
+
+    static List<InputSpacePartitionTestSpace<?>> validateSpaces(
+            List<InputSpacePartitionTestSpace<?>> spaces) {
+        var validated = InputSpacePartitionTestNode.validateChildren(
+                spaces, InputSpacePartitionTestSpace::name);
+        if (validated.isEmpty()) throw new IllegalArgumentException("No test spaces registered");
+        return validated;
+    }
+
     @FunctionalInterface
     public interface PathCheck {
         void execute(InputSpacePartitionTestContext context,
@@ -30,7 +48,15 @@ public final class InputSpacePartitionTestTreeFactory {
                                         exists -> exists ? "existing" : "missing",
                                         stateChoice("path_depth", PATH_DEPTH, List.of(0, 1, 2), Object::toString,
                                                 verification((context, execution) -> context.testFileWrite())))))),
-                FilePatchOperationTestNode.create()));
+                fixtureChoice("file_patch", List.of(
+                        fixtureLeaf("replacement", (context, execution) ->
+                                new FilePatchTestFixture(context).replacement()),
+                        fixtureLeaf("insertion", (context, execution) ->
+                                new FilePatchTestFixture(context).insertion()),
+                        fixtureLeaf("deletion", (context, execution) ->
+                                new FilePatchTestFixture(context).deletion()),
+                        fixtureLeaf("stale_rejected", (context, execution) ->
+                                new FilePatchTestFixture(context).stalePatchIsRejected())))));
 
         PathCheck input = (context, fixture, path) ->
                 context.assertInputRejected(fixture.workingDirectory(), path);

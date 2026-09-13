@@ -9,15 +9,15 @@ import java.util.Objects;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** Counts full leaf paths independently; branch totals sum their descendants. */
+/** Counts executable-tree leaf paths independently; branch totals sum their descendants. */
 public final class InputSpacePartitionHierarchy {
     private final Map<String, Integer> counts = new LinkedHashMap<>();
-    private final List<InputSpacePartitionNode> roots;
+    private final List<InputSpacePartitionTestNode<?>> roots;
 
-    public InputSpacePartitionHierarchy(Collection<InputSpacePartitionNode> roots) {
-        this.roots = InputSpacePartitionNode.validateChildren(
-                List.copyOf(Objects.requireNonNull(roots, "roots")), InputSpacePartitionNode::name);
-        for (InputSpacePartitionNode node : this.roots) initialize(node, "");
+    public InputSpacePartitionHierarchy(Collection<? extends InputSpacePartitionTestNode<?>> roots) {
+        this.roots = InputSpacePartitionTestNode.validateChildren(
+                List.copyOf(Objects.requireNonNull(roots, "roots")), InputSpacePartitionTestNode::name);
+        traverse(null, this.roots, "", "");
     }
 
     public void record(String path) {
@@ -40,22 +40,21 @@ public final class InputSpacePartitionHierarchy {
         assertTrue(missing.isEmpty(), () -> "Input-space partitions were not exercised: " + missing);
     }
 
-    public void printPaths(PrintStream output) { printBranches(output, roots, "", ""); }
-
-    private void initialize(InputSpacePartitionNode node, String parent) {
-        String path = qualify(parent, node.name());
-        if (node.isLeaf()) counts.put(path, 0);
-        for (InputSpacePartitionNode child : node.children()) initialize(child, path);
+    public void printPaths(PrintStream output) {
+        traverse(Objects.requireNonNull(output, "output"), roots, "", "");
     }
 
-    private void printBranches(PrintStream output, List<InputSpacePartitionNode> branches,
+    /** A null output initializes leaf counters; reporting never changes them. */
+    private void traverse(PrintStream output, List<? extends InputSpacePartitionTestNode<?>> branches,
             String parent, String prefix) {
         for (int index = 0; index < branches.size(); index++) {
-            InputSpacePartitionNode node = branches.get(index);
+            InputSpacePartitionTestNode<?> node = branches.get(index);
             String path = qualify(parent, node.name());
             boolean last = index == branches.size() - 1;
-            output.println(prefix + (last ? "└─" : "├─") + node.name() + ": " + total(path));
-            printBranches(output, node.children(), path, prefix + (last ? "  " : "│ "));
+            if (output != null)
+                output.println(prefix + (last ? "└─" : "├─") + node.name() + ": " + total(path));
+            else if (node.isLeaf()) counts.put(path, 0);
+            traverse(output, node.children(), path, prefix + (last ? "  " : "│ "));
         }
     }
 

@@ -12,7 +12,7 @@ import java.util.Set;
 /** Command-line entry point. */
 public final class TheAICommand {
     private static final Map<String, String> DEFAULTS = Map.of(
-            "--backend", "codex", "--model", "gpt-5.2");
+            "--backend", "codex", "--model", "gpt-5.2", "--context", "context.json");
     private static final Set<String> VALUE_OPTIONS = Set.of("--backend", "--model", "--context");
     private static final Map<String, String> DESCRIPTIONS = descriptions();
 
@@ -21,6 +21,7 @@ public final class TheAICommand {
     private static Map<String, String> descriptions() {
         Map<String, String> descriptions = new LinkedHashMap<>();
         descriptions.put("--help", "Print this help and exit without reading stdin or contacting an LLM.");
+        descriptions.put("--disable-conversation-history", "Disable conversation history recording and registration.");
         descriptions.put("--backend", "Choose codex, openai, or loopback.");
         descriptions.put("--model", "Choose the model used by the openai backend.");
         descriptions.put("--context", "Load ordered files and READ/READ_WRITE permissions from a JSON file.");
@@ -41,8 +42,6 @@ public final class TheAICommand {
                 return 0;
             }
             Path directory = Path.of(".");
-            RequestContext context = options.containsKey("--context")
-                    ? RequestContext.load(directory, options.get("--context")) : RequestContext.empty();
             byte[] stdin = System.in.readAllBytes();
             String backend = options.get("--backend").toLowerCase(Locale.ROOT);
             LLMProvider provider = switch (backend) {
@@ -53,7 +52,8 @@ public final class TheAICommand {
             };
             try (AICommandApplication application =
                          new AICommandApplication(provider, System.out, directory)) {
-                application.run(stdin, files, context);
+                application.runWithHistory(stdin, files, options.get("--context"),
+                        options.containsKey("--disable-conversation-history"));
             }
             return 0;
         } catch (IOException | RuntimeException exception) {
@@ -77,7 +77,7 @@ public final class TheAICommand {
         System.out.println();
         System.out.println("Value options accept --name value or --name=value; the last value wins.");
         System.out.println("Context example: {\"files\":[{\"README.md\":\"READ\"},{\"src/example.txt\":\"READ_WRITE\"}]}");
-        System.out.println("No context file is loaded unless --context is supplied.");
+        System.out.println("Without --context, context.json in the working directory is used.");
         System.out.println("Context paths and command-line files are relative to the working directory.");
         System.out.println("The embedded read-only CIOP document comes first, then context files, extra files, and stdin.");
         System.out.println("Duplicate context files are errors. Argument duplicates retain context permissions.");
@@ -87,6 +87,11 @@ public final class TheAICommand {
         System.out.println("The openai backend requires OPENAI_API_KEY; codex requires the codex executable.");
         System.out.println("Loopback echoes the prompt unchanged and is primarily intended for testing.");
         System.out.println("Prompt/response logs are written to /tmp by default, except with loopback.");
+        System.out.println("History is recorded in conversation_history/YYYY-MM-DD.txt only if the directory already exists.");
+        System.out.println("The history directory is never created automatically; --disable-conversation-history disables recording.");
+        System.out.println("History files are registered as READ in the selected context file before it is loaded.");
+        System.out.println("A missing context file is not created; the request uses an empty context.");
+        System.out.println("The history directory and its context configuration cannot be overwritten by response operations.");
     }
 
     static Map<String, String> parseOptions(String[] args, List<String> files) {

@@ -1,19 +1,19 @@
 package org.res.ai;
 
 public class ShellProcessFinalResult {
-	private ShellProcessPartialResult output = null;
-	private int returnValue;
+    private final ShellProcessPartialResult output;
+    private final int returnValue;
 
-	public ShellProcessFinalResult(ShellProcessPartialResult output, int returnValue) throws Exception {
-		this.output = output;
-		this.returnValue = returnValue;
-	}
+    public ShellProcessFinalResult(ShellProcessPartialResult output, int returnValue) {
+        this.output = output;
+        this.returnValue = returnValue;
+    }
 
-	public ShellProcessPartialResult getOutput() throws Exception {
-		return this.output;
-	}
+    public ShellProcessPartialResult getOutput() {
+        return output;
+    }
 
-	public int getReturnValue() throws Exception {
-		return this.returnValue;
-	}
+    public int getReturnValue() {
+        return returnValue;
+    }
 }

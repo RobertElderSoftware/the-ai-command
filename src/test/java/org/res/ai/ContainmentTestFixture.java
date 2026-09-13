@@ -11,10 +11,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Filesystem topology and common assertions for containment scenarios. */
 public final class ContainmentTestFixture {
-    public static final InputSpacePartitionStateKey<ContainmentTestFixture> KEY =
-            InputSpacePartitionStateKey.of(
-                    "containment fixture", ContainmentTestFixture.class);
-
     private final Path workingDirectory;
     private final Path outsideFile;
     private final Path outsideMissingTarget;

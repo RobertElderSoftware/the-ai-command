@@ -20,7 +20,7 @@ class InputSpacePartitionInfrastructureTest {
                         InputSpacePartitionTestNode.fixtureLeaf("one", (fixture, execution) -> { }),
                         InputSpacePartitionTestNode.fixtureLeaf("two", (fixture, execution) -> { })));
         var root = InputSpacePartitionTestNode.fixtureChoice("root", List.of(sequence));
-        var coverage = new InputSpacePartitionHierarchy(List.of(root.toPartitionNode()));
+        var coverage = new InputSpacePartitionHierarchy(List.of(root));
         root.execute("fixture", new InputSpacePartitionExecution(new Random(1), coverage, 0));
         assertEquals(1, coverage.count("root.sequence.one"));
         assertEquals(1, coverage.count("root.sequence.two"));
@@ -43,7 +43,7 @@ class InputSpacePartitionInfrastructureTest {
                 InputSpacePartitionTestNode.fixtureSequence("b", (fixture, execution) -> { }, List.of(shared)),
                 InputSpacePartitionTestNode.fixtureSequence("c", (fixture, execution) -> { }, List.of(
                         InputSpacePartitionTestNode.<String>fixtureLeaf("same", (fixture, execution) -> { })))));
-        var metadata = List.of(root.toPartitionNode());
+        var metadata = List.of(root);
         var coverage = new InputSpacePartitionHierarchy(metadata);
         coverage.record("root.a.same");
         AssertionError missing = assertThrows(AssertionError.class, coverage::assertAllLeavesRecorded);
@@ -57,7 +57,7 @@ class InputSpacePartitionInfrastructureTest {
         assertThrows(AssertionError.class, new InputSpacePartitionHierarchy(metadata)::assertAllLeavesRecorded);
         assertThrows(IllegalArgumentException.class, () -> coverage.record("unknown"));
         assertThrows(IllegalArgumentException.class, () -> new InputSpacePartitionHierarchy(List.of(
-                InputSpacePartitionNode.leaf("same"), InputSpacePartitionNode.leaf("same"))));
+                shared, InputSpacePartitionTestNode.<String>fixtureLeaf("same", fixture -> { }))));
     }
 
     @Test
@@ -67,7 +67,7 @@ class InputSpacePartitionInfrastructureTest {
         var root = InputSpacePartitionTestNode.fixtureChoice("root", List.of(
                 InputSpacePartitionTestNode.fixtureSequence("a", (fixture, execution) -> fixture.append("setup"), List.of(shared)),
                 InputSpacePartitionTestNode.fixtureSequence("b", (fixture, execution) -> fixture.append("setup"), List.of(shared))));
-        var metadata = List.of(root.toPartitionNode());
+        var metadata = List.of(root);
         var first = new InputSpacePartitionHierarchy(metadata);
         var second = new InputSpacePartitionHierarchy(metadata);
         // Deliberately different counts must not influence selection.
@@ -111,10 +111,10 @@ class InputSpacePartitionInfrastructureTest {
         var strings = new InputSpacePartitionTestSpace<>("strings", List.of(
                 InputSpacePartitionTestNode.<String>fixtureLeaf("same", (fixture, execution) -> assertEquals("text", fixture))),
                 execution -> "text", fixture -> { });
-        var registry = new InputSpacePartitionTestRegistry(List.of(lists, strings));
-        assertEquals(2, registry.spaces().size());
-        assertThrows(IllegalArgumentException.class, () -> new InputSpacePartitionTestRegistry(List.of(lists, lists)));
-        assertThrows(IllegalArgumentException.class, () -> new InputSpacePartitionTestRegistry(List.of()));
+        var spaces = InputSpacePartitionTestTreeFactory.validateSpaces(List.of(lists, strings));
+        assertEquals(List.of(lists, strings), spaces);
+        assertThrows(IllegalArgumentException.class, () -> InputSpacePartitionTestTreeFactory.validateSpaces(List.of(lists, lists)));
+        assertThrows(IllegalArgumentException.class, () -> InputSpacePartitionTestTreeFactory.validateSpaces(List.of()));
         var coverage = lists.newCoverage();
         var otherCoverage = strings.newCoverage();
         for (int iteration = 0; iteration < 2; iteration++) {

@@ -1,10 +1,12 @@
 package org.res.ai;
 
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.Function;
 
-/** Executable tree parameterized by its component fixture. */
+/** Executable tree parameterized by its component fixture, also used for coverage reporting. */
 public final class InputSpacePartitionTestNode<F> {
     /** A fixture action that does not need execution facilities. */
     @FunctionalInterface
@@ -24,8 +26,8 @@ public final class InputSpacePartitionTestNode<F> {
 
     private InputSpacePartitionTestNode(String name, List<InputSpacePartitionTestNode<F>> children,
             FixtureAction<F> action, boolean choice) {
-        this.name = InputSpacePartitionNode.validateName(name);
-        this.children = InputSpacePartitionNode.validateChildren(children, InputSpacePartitionTestNode::name);
+        this.name = validateName(name);
+        this.children = validateChildren(children, InputSpacePartitionTestNode::name);
         this.action = Objects.requireNonNull(action, "action");
         this.choice = choice;
         if (choice && this.children.isEmpty())
@@ -85,8 +87,21 @@ public final class InputSpacePartitionTestNode<F> {
         }
     }
 
-    public InputSpacePartitionNode toPartitionNode() {
-        return new InputSpacePartitionNode(name,
-                children.stream().map(InputSpacePartitionTestNode::toPartitionNode).toList());
+    static String validateName(String name) {
+        Objects.requireNonNull(name, "name");
+        if (name.isBlank() || name.indexOf('.') >= 0)
+            throw new IllegalArgumentException("Hierarchy node name must be one nonblank segment: " + name);
+        return name;
+    }
+
+    static <T> List<T> validateChildren(List<T> children, Function<T, String> naming) {
+        List<T> copy = List.copyOf(Objects.requireNonNull(children, "children"));
+        Set<String> names = new LinkedHashSet<>();
+        for (T child : copy) {
+            String name = naming.apply(child);
+            if (!names.add(name))
+                throw new IllegalArgumentException("Duplicate child hierarchy node: " + name);
+        }
+        return copy;
     }
 }

@@ -192,7 +192,7 @@ class RequestContextTest {
         assertEquals("second.json", options.get("--context"));
         assertEquals("loopback", options.get("--backend"));
         assertEquals(List.of("read.txt", "--context=filename"), files);
-        assertFalse(TheAICommand.parseOptions(new String[0], new ArrayList<>()).containsKey("--context"));
+        assertEquals("context.json", TheAICommand.parseOptions(new String[0], new ArrayList<>()).get("--context"));
         assertTrue(TheAICommand.parseOptions(new String[] {"--help"}, new ArrayList<>()).containsKey("--help"));
         for (String[] args : List.of(new String[] {"--context"}, new String[] {"--context="}, new String[] {"--help=x"}))
             assertThrows(IllegalArgumentException.class, () -> TheAICommand.parseOptions(args, new ArrayList<>()));

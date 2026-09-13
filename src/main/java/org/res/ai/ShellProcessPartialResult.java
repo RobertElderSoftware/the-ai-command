@@ -1,20 +1,19 @@
 package org.res.ai;
 
 public class ShellProcessPartialResult {
+    private final byte[] stdout;
+    private final byte[] stderr;
 
-	private byte [] stdout = null;
-	private byte [] stderr = null;
+    public ShellProcessPartialResult(byte[] stdout, byte[] stderr) {
+        this.stdout = stdout;
+        this.stderr = stderr;
+    }
 
-	public ShellProcessPartialResult(byte [] stdout, byte [] stderr) throws Exception {
-		this.stdout = stdout;
-		this.stderr = stderr;
-	}
+    public byte[] getStdoutOutput() {
+        return stdout;
+    }
 
-	public byte [] getStdoutOutput() throws Exception {
-		return this.stdout;
-	}
-
-	public byte [] getStderrOutput() throws Exception {
-		return this.stderr;
-	}
+    public byte[] getStderrOutput() {
+        return stderr;
+    }
 }
