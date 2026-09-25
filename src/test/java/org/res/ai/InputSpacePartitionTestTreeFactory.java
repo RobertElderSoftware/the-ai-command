@@ -56,7 +56,34 @@ public final class InputSpacePartitionTestTreeFactory {
                         fixtureLeaf("deletion", (context, execution) ->
                                 new FilePatchTestFixture(context).deletion()),
                         fixtureLeaf("stale_rejected", (context, execution) ->
-                                new FilePatchTestFixture(context).stalePatchIsRejected())))));
+                                new FilePatchTestFixture(context).stalePatchIsRejected()))),
+                fixtureLeaf("file_patch_binary", (context, execution) ->
+                        new FilePatchTestFixture(context).binaryRegressions()),
+                fixtureLeaf("file_delete", (context, execution) -> {
+                    String path = "delete.txt";
+                    var target = context.resolve(path);
+                    var deletion = TestJson.object("op", "file_delete", "path", path);
+                    java.nio.file.Files.writeString(target, "original");
+                    org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                            () -> context.execute(deletion, java.util.Set.of()));
+                    org.junit.jupiter.api.Assertions.assertEquals("original", java.nio.file.Files.readString(target));
+                    context.execute(deletion, java.util.Set.of(path));
+                    org.junit.jupiter.api.Assertions.assertFalse(java.nio.file.Files.exists(target));
+                    context.execute(deletion, java.util.Set.of(path));
+                    java.nio.file.Files.createDirectory(target);
+                    org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                            () -> context.execute(deletion, java.util.Set.of(path)));
+                    java.nio.file.Files.delete(target);
+                    java.nio.file.Files.writeString(context.resolve("protected.txt"), "protected");
+                    java.nio.file.Files.createSymbolicLink(target, context.resolve("protected.txt"));
+                    org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                            () -> context.execute(deletion, java.util.Set.of(path)));
+                    org.junit.jupiter.api.Assertions.assertEquals("protected",
+                            java.nio.file.Files.readString(context.resolve("protected.txt")));
+                    var traversal = TestJson.object("op", "file_delete", "path", "../outside.txt");
+                    org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                            () -> context.execute(traversal, java.util.Set.of("../outside.txt")));
+                })));
 
         PathCheck input = (context, fixture, path) ->
                 context.assertInputRejected(fixture.workingDirectory(), path);

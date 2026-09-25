@@ -21,7 +21,9 @@ public final class TheAICommand {
     private static Map<String, String> descriptions() {
         Map<String, String> descriptions = new LinkedHashMap<>();
         descriptions.put("--help", "Print this help and exit without reading stdin or contacting an LLM.");
+        descriptions.put("--enable-conversation-history", "Enable history recording, creating the conversation_history directory if missing.");
         descriptions.put("--disable-conversation-history", "Disable conversation history recording and registration.");
+        descriptions.put("--ignore-context", "Ignore the default or explicitly selected context file, including history registration.");
         descriptions.put("--backend", "Choose codex, openai, or loopback.");
         descriptions.put("--model", "Choose the model used by the openai backend.");
         descriptions.put("--context", "Load ordered files and READ/READ_WRITE permissions from a JSON file.");
@@ -53,7 +55,9 @@ public final class TheAICommand {
             try (AICommandApplication application =
                          new AICommandApplication(provider, System.out, directory)) {
                 application.runWithHistory(stdin, files, options.get("--context"),
-                        options.containsKey("--disable-conversation-history"));
+                        options.containsKey("--disable-conversation-history"),
+                        options.containsKey("--ignore-context"),
+                        options.containsKey("--enable-conversation-history"));
             }
             return 0;
         } catch (IOException | RuntimeException exception) {
@@ -88,7 +92,8 @@ public final class TheAICommand {
         System.out.println("Loopback echoes the prompt unchanged and is primarily intended for testing.");
         System.out.println("Prompt/response logs are written to /tmp by default, except with loopback.");
         System.out.println("History is recorded in conversation_history/YYYY-MM-DD.txt only if the directory already exists.");
-        System.out.println("The history directory is never created automatically; --disable-conversation-history disables recording.");
+        System.out.println("Use --enable-conversation-history to create the history directory; --disable-conversation-history disables recording.");
+        System.out.println("The enable and disable conversation-history flags cannot be combined.");
         System.out.println("History files are registered as READ in the selected context file before it is loaded.");
         System.out.println("A missing context file is not created; the request uses an empty context.");
         System.out.println("The history directory and its context configuration cannot be overwritten by response operations.");
@@ -118,6 +123,9 @@ public final class TheAICommand {
                 values.put(name, value);
             }
         }
+        if (values.containsKey("--enable-conversation-history")
+                && values.containsKey("--disable-conversation-history"))
+            throw new IllegalArgumentException("Cannot combine --enable-conversation-history and --disable-conversation-history");
         return values;
     }
 }

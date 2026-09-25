@@ -4,7 +4,9 @@ package org.res.ai;
 public enum OperationType {
     STDOUT("stdout"),
     FILE_WRITE("file_write"),
-    FILE_PATCH("file_patch");
+    FILE_PATCH("file_patch"),
+    FILE_PATCH_BINARY("file_patch_binary"),
+    FILE_DELETE("file_delete");
 
     private final String opcode;
 

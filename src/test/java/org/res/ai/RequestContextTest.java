@@ -88,6 +88,16 @@ class RequestContextTest {
             run(directory, context, arguments, edit("write.txt", patch));
             assertEquals("changed\n", Files.readString(directory.resolve("write.txt")));
         }
+        for (String path : List.of("read.txt", "./read.txt", "alias.txt", ProtocolDocument.PATH)) {
+            assertThrows(IllegalArgumentException.class, () -> run(directory, context, arguments,
+                    object("op", "file_delete", "path", path)));
+            assertContents(directory, "original\n", "read.txt", "alias.txt");
+        }
+        run(directory, context, arguments, object("op", "file_delete", "path", "write.txt"));
+        assertFalse(Files.exists(directory.resolve("write.txt")));
+        Files.writeString(directory.resolve("extra.txt"), "temporary");
+        run(directory, context, arguments, object("op", "file_delete", "path", "extra.txt"));
+        assertFalse(Files.exists(directory.resolve("extra.txt")));
         run(directory, context, arguments, edit("extra.txt", false));
         assertEquals("changed\n", Files.readString(directory.resolve("extra.txt")));
         Files.writeString(directory.resolve("write.txt"), "original\n");

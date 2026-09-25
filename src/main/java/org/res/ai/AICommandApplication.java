@@ -8,15 +8,10 @@ import com.google.gson.JsonPrimitive;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.management.ManagementFactory;
-import java.nio.ByteBuffer;
-import java.nio.charset.CharacterCodingException;
-import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -80,12 +75,32 @@ public class AICommandApplication implements AutoCloseable {
     /** Recording requires an existing history directory and can be explicitly disabled. */
     public void runWithHistory(byte[] stdin, List<String> inputPaths, String contextFilename,
             boolean disableConversationHistory) throws IOException {
+        runWithHistory(stdin, inputPaths, contextFilename, disableConversationHistory, false);
+    }
+
+    /** Ignore context loading and registration while retaining history recording. */
+    public void runWithHistory(byte[] stdin, List<String> inputPaths, String contextFilename,
+            boolean disableConversationHistory, boolean ignoreContext) throws IOException {
+        runWithHistory(stdin, inputPaths, contextFilename, disableConversationHistory, ignoreContext, false);
+    }
+
+    /** Explicit enabling creates the history directory before recording the input. */
+    public void runWithHistory(byte[] stdin, List<String> inputPaths, String contextFilename,
+            boolean disableConversationHistory, boolean ignoreContext,
+            boolean enableConversationHistory) throws IOException {
+        if (enableConversationHistory && disableConversationHistory)
+            throw new IllegalArgumentException("Cannot combine --enable-conversation-history and --disable-conversation-history");
+        if (enableConversationHistory) {
+            Files.createDirectories(resolve(ConversationHistory.DIRECTORY));
+        }
+
         ConversationHistory history = new ConversationHistory(workingDirectory, contextFilename,
-                !disableConversationHistory);
+                !disableConversationHistory, !ignoreContext);
+
         byte[] input = stdin == null ? new byte[0] : stdin;
         try {
             history.input(input);
-            RequestContext context = Files.notExists(resolve(history.contextFilename()), NO_FOLLOW)
+            RequestContext context = ignoreContext || Files.notExists(resolve(history.contextFilename()), NO_FOLLOW)
                     ? RequestContext.empty()
                     : RequestContext.load(workingDirectory, history.contextFilename());
             run(input, inputPaths, context, history);
@@ -183,7 +198,7 @@ public class AICommandApplication implements AutoCloseable {
     }
 
     private static String section(String source, byte[] bytes, String metadata) {
-        String text = strictUtf8(bytes);
+        String text = Encoding.strictUtf8(bytes);
         String encoding = text == null || !safeText(text) ? "base64" : "utf-8";
         String payload = "base64".equals(encoding) ? Base64.getEncoder().encodeToString(bytes) : text;
         return "---SECTION " + source + " " + encoding + " " + bytes.length + " " + sha256(bytes)
@@ -200,44 +215,16 @@ public class AICommandApplication implements AutoCloseable {
         for (int index = 0; index < operations.size(); index++) {
             Operation operation = operations.get(index);
             try {
-                byte[] bytes = null;
-                if (operation.type != OperationType.FILE_PATCH) {
-                    bytes = operation.decode();
-                    if (operation.length != null && operation.length != bytes.length)
-                        throw new IllegalArgumentException("Output length verification failed");
-                    if (operation.sha256 != null && !sha256(bytes).equalsIgnoreCase(operation.sha256))
-                        throw new IllegalArgumentException("Output sha256 verification failed");
-                }
                 if (operation.type == OperationType.STDOUT) {
-                    output.writeBytes(bytes);
+                    output.writeBytes(operation.decode());
                     continue;
                 }
                 requireAllowed(operation.path, allowedPaths, operation.type.opcode());
                 Path target = resolve(operation.path);
                 requireWritable(target, readOnlyPaths);
-                if (!originals.containsKey(target)) {
-                    for (Path other : originals.keySet()) {
-                        if (target.startsWith(other) || other.startsWith(target))
-                            throw new IllegalArgumentException("Conflicting file/directory destinations: " + target + " and " + other);
-                        if (Files.exists(target, NO_FOLLOW) && Files.exists(other, NO_FOLLOW)
-                                && Files.isSameFile(target, other))
-                            throw new IllegalArgumentException("Distinct hard-linked destinations: " + target + " and " + other);
-                    }
-                    for (Path parent = target.getParent(); parent != null && parent.startsWith(workingDirectory);
-                            parent = parent.getParent()) {
-                        if (Files.exists(parent, NO_FOLLOW) && !Files.isDirectory(parent, NO_FOLLOW))
-                            throw new IllegalArgumentException("Unsafe output directory: " + parent);
-                    }
-                    originals.put(target, readTarget(target));
-                    identities.put(target, fileIdentity(target));
-                }
-                if (operation.type == OperationType.FILE_PATCH) {
-                    byte[] source = staged.containsKey(target) ? staged.get(target) : originals.get(target);
-                    if (source == null)
-                        throw new IllegalArgumentException("file_patch requires an existing regular file: " + operation.path);
-                    bytes = calculatePatch(operation.patch, source);
-                }
-                staged.put(target, bytes);
+                prepareDestination(target, originals, identities);
+                byte[] source = staged.containsKey(target) ? staged.get(target) : originals.get(target);
+                staged.put(target, calculateOperation(operation, source));
             } catch (IOException | RuntimeException exception) {
                 String message = "Operation " + (index + 1) + "/" + operations.size()
                         + " (" + operation.type.opcode()
@@ -250,6 +237,42 @@ public class AICommandApplication implements AutoCloseable {
         }
         commitBatch(staged, originals, identities, readOnlyPaths);
         return publishOutput(output);
+    }
+
+    private byte[] calculateOperation(Operation operation, byte[] source) {
+        return switch (operation.type) {
+            case STDOUT, FILE_WRITE -> operation.decode();
+            case FILE_DELETE -> null;
+            case FILE_PATCH, FILE_PATCH_BINARY -> {
+                if (source == null)
+                    throw new IllegalArgumentException(operation.type.opcode()
+                            + " requires an existing regular file: " + operation.path);
+                yield operation.type == OperationType.FILE_PATCH
+                        ? calculatePatch(operation.patch, source)
+                        : calculateBinaryPatch(operation.binaryPatch, source);
+            }
+        };
+    }
+
+
+    private void prepareDestination(Path target,
+            java.util.Map<Path, byte[]> originals,
+            java.util.Map<Path, Object> identities) throws IOException {
+        if (originals.containsKey(target)) return;
+        for (Path other : originals.keySet()) {
+            if (target.startsWith(other) || other.startsWith(target))
+                throw new IllegalArgumentException("Conflicting file/directory destinations: " + target + " and " + other);
+            if (Files.exists(target, NO_FOLLOW) && Files.exists(other, NO_FOLLOW)
+                    && Files.isSameFile(target, other))
+                throw new IllegalArgumentException("Distinct hard-linked destinations: " + target + " and " + other);
+        }
+        for (Path parent = target.getParent(); parent != null && parent.startsWith(workingDirectory);
+                parent = parent.getParent()) {
+            if (Files.exists(parent, NO_FOLLOW) && !Files.isDirectory(parent, NO_FOLLOW))
+                throw new IllegalArgumentException("Unsafe output directory: " + parent);
+        }
+        originals.put(target, readTarget(target));
+        identities.put(target, fileIdentity(target));
     }
 
     private void commitBatch(java.util.Map<Path, byte[]> staged,
@@ -266,7 +289,8 @@ public class AICommandApplication implements AutoCloseable {
             for (Path target : staged.keySet()) {
                 requireWritable(target, readOnlyPaths);
                 checkSnapshot(target, originals.get(target), identities.get(target));
-                createBatchDirectories(target.getParent(), directories);
+                if (staged.get(target) != null)
+                    createBatchDirectories(target.getParent(), directories);
                 attempted.add(target); // Include a destination even if its write fails partway through.
                 commitFile(target, staged.get(target));
             }
@@ -374,14 +398,52 @@ public class AICommandApplication implements AutoCloseable {
         }
     }
 
-    private byte[] calculatePatch(FilePatch patch, byte[] sourceBytes) {
-        String actualHash = sha256(sourceBytes);
-        String expectedHash = normalizeHash(patch.sourceSha256(), "source_sha256");
-        if (!actualHash.equals(expectedHash)) {
-            throw new IllegalArgumentException("file_patch source_sha256 mismatch: expected="
-                    + expectedHash + ", actual=" + actualHash + "; target was not modified by this patch");
+    private byte[] calculateBinaryPatch(JsonObject patch, byte[] source) {
+        verifyPatchHash(source, requiredString(patch, "source_sha256"), "source_sha256", "file_patch_binary");
+        JsonElement hunks = patch.get("hunks");
+        if (hunks == null || !hunks.isJsonArray() || hunks.getAsJsonArray().isEmpty())
+            throw new IllegalArgumentException("file_patch_binary requires nonempty hunks");
+        java.io.ByteArrayOutputStream result = new java.io.ByteArrayOutputStream();
+        int cursor = 0;
+        for (JsonElement element : hunks.getAsJsonArray()) {
+            if (!element.isJsonObject()) throw new IllegalArgumentException("Binary hunk must be an object");
+            JsonObject hunk = element.getAsJsonObject();
+            int offset = requiredByteCount(hunk, "offset");
+            int remove = requiredByteCount(hunk, "remove_count");
+            if (offset < cursor || offset > source.length || remove > source.length - offset)
+                throw new IllegalArgumentException("Binary hunks overlap, are unordered, or exceed source bounds");
+            if (!"base64".equals(requiredString(hunk, "encoding")))
+                throw new IllegalArgumentException("Binary hunk encoding must be base64");
+            byte[] added = Base64.getDecoder().decode(requiredString(hunk, "data"));
+            if ((long) result.size() + offset - cursor + added.length + source.length - offset - remove > Integer.MAX_VALUE)
+                throw new IllegalArgumentException("Binary patch result is too large");
+            result.write(source, cursor, offset - cursor);
+            result.writeBytes(added);
+            cursor = offset + remove;
         }
-        String source = strictUtf8(sourceBytes);
+        result.write(source, cursor, source.length - cursor);
+        byte[] bytes = result.toByteArray();
+        if (patch.has("result_sha256"))
+            verifyPatchHash(bytes, requiredString(patch, "result_sha256"), "result_sha256", "file_patch_binary");
+        return bytes;
+    }
+
+    private static int requiredByteCount(JsonObject object, String name) {
+        JsonElement value = object.get(name);
+        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber())
+            throw new IllegalArgumentException("Missing integer '" + name + "'");
+        try {
+            int count = value.getAsBigDecimal().intValueExact();
+            if (count < 0) throw new ArithmeticException("negative");
+            return count;
+        } catch (ArithmeticException exception) {
+            throw new IllegalArgumentException("Invalid byte count '" + name + "'", exception);
+        }
+    }
+
+    private byte[] calculatePatch(FilePatch patch, byte[] sourceBytes) {
+        verifyPatchHash(sourceBytes, patch.sourceSha256(), "source_sha256", "file_patch");
+        String source = Encoding.strictUtf8(sourceBytes);
         if (source == null) throw new IllegalArgumentException("file_patch source is not valid UTF-8");
         boolean sourceFinalNewline = source.endsWith("\n");
         List<String> oldLines = sourceLines(source);
@@ -415,12 +477,8 @@ public class AICommandApplication implements AutoCloseable {
         boolean finalNewline = patch.finalNewline() == null ? sourceFinalNewline : patch.finalNewline();
         String resultText = String.join("\n", result) + (finalNewline ? "\n" : "");
         byte[] resultBytes = resultText.getBytes(StandardCharsets.UTF_8);
-        if (patch.resultSha256() != null
-                && !sha256(resultBytes).equals(normalizeHash(patch.resultSha256(), "result_sha256"))) {
-            throw new IllegalArgumentException("file_patch result_sha256 mismatch: expected="
-                    + patch.resultSha256() + ", actual=" + sha256(resultBytes)
-                    + "; target was not modified by this patch");
-        }
+        if (patch.resultSha256() != null)
+            verifyPatchHash(resultBytes, patch.resultSha256(), "result_sha256", "file_patch");
         return resultBytes;
     }
 
@@ -457,26 +515,12 @@ public class AICommandApplication implements AutoCloseable {
     }
 
     private void atomicReplace(String pathText, Path target, byte[] bytes) throws IOException {
-        Path parent = target.getParent();
-        Path temporary = Files.createTempFile(parent, ".ciop-patch-", ".tmp");
-        try {
-            Files.write(temporary, bytes, StandardOpenOption.TRUNCATE_EXISTING);
+        AtomicFileReplacement.replace(target, bytes, ".ciop-patch-", false, () -> {
             Path checkedTarget = resolve(pathText);
             if (!checkedTarget.equals(target) || !Files.isRegularFile(checkedTarget, NO_FOLLOW)) {
                 throw new IllegalArgumentException("Patch target changed during validation");
             }
-            var permissions = Files.getFileAttributeView(checkedTarget,
-                    java.nio.file.attribute.PosixFileAttributeView.class, LinkOption.NOFOLLOW_LINKS);
-            if (permissions != null)
-                Files.setPosixFilePermissions(temporary, permissions.readAttributes().permissions());
-            try {
-                Files.move(temporary, checkedTarget, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            } catch (AtomicMoveNotSupportedException exception) {
-                Files.move(temporary, checkedTarget, StandardCopyOption.REPLACE_EXISTING);
-            }
-        } finally {
-            Files.deleteIfExists(temporary);
-        }
+        });
     }
 
 
@@ -507,16 +551,18 @@ public class AICommandApplication implements AutoCloseable {
             if (!element.isJsonObject()) throw new IllegalArgumentException("Operation must be an object");
             JsonObject object = element.getAsJsonObject();
             OperationType type = OperationType.fromOpcode(requiredString(object, "op"));
-            if (type == OperationType.FILE_PATCH) {
-                FilePatch patch = parsePatch(object);
-                operations.add(new Operation(type, patch.path(), null, null, null, null, patch));
-            } else {
-                String encoding = requiredString(object, "encoding");
-                Encoding.fromToken(encoding);
-                operations.add(new Operation(type, optionalString(object, "path"), encoding,
-                        requiredString(object, "data"), optionalLong(object, "length"),
-                        optionalString(object, "sha256")));
-            }
+            operations.add(switch (type) {
+                case FILE_DELETE -> Operation.deletion(requiredString(object, "path"));
+                case FILE_PATCH_BINARY -> new Operation(requiredString(object, "path"), object);
+                case FILE_PATCH -> Operation.textPatch(parsePatch(object));
+                case STDOUT, FILE_WRITE -> {
+                    String encoding = requiredString(object, "encoding");
+                    Encoding.fromToken(encoding);
+                    yield new Operation(type, optionalString(object, "path"), encoding,
+                            requiredString(object, "data"), optionalLong(object, "length"),
+                            optionalString(object, "sha256"));
+                }
+            });
         }
         return operations;
     }
@@ -546,6 +592,16 @@ public class AICommandApplication implements AutoCloseable {
         }
         return new FilePatch(path, sourceHash, resultHash, finalNewline, hunks);
     }
+
+    private static void verifyPatchHash(byte[] bytes, String hash, String field, String opcode) {
+        String expected = normalizeHash(hash, field);
+        String actual = sha256(bytes);
+        if (!actual.equals(expected))
+            throw new IllegalArgumentException(opcode + " " + field
+                    + " mismatch: expected=" + expected + ", actual=" + actual
+                    + "; target was not modified by this patch");
+    }
+
 
     private static String normalizeHash(String hash, String field) {
         String normalized = Objects.requireNonNull(hash, field).toLowerCase(Locale.ROOT);
@@ -584,13 +640,6 @@ public class AICommandApplication implements AutoCloseable {
         JsonElement value = object.get(name);
         return value == null || value.isJsonNull() || !value.isJsonPrimitive()
                 || !value.getAsJsonPrimitive().isString() ? null : value.getAsString();
-    }
-
-    private static String strictUtf8(byte[] bytes) {
-        try {
-            return StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
-                    .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes)).toString();
-        } catch (CharacterCodingException exception) { return null; }
     }
 
     private static boolean safeText(String text) {

@@ -2,7 +2,7 @@ package org.res.ai;
 
 import java.io.IOException;
 
-/** Loads the authoritative protocol resource independently of the working directory. */
+/** Loads the embedded CIOP protocol specification. */
 public final class ProtocolDocument {
     public static final String PATH = "__ciop__/CIOP_PROTOCOL_INSTRUCTIONS.txt";
 

@@ -8,13 +8,10 @@ import com.google.gson.JsonObject;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Clock;
 import java.time.OffsetDateTime;
@@ -38,6 +35,7 @@ public final class ConversationHistory {
     private final String contextFilename;
     private final Clock clock;
     private final boolean enabled;
+    private final boolean registerContext;
     private final String requestId = UUID.randomUUID().toString();
 
     public ConversationHistory(Path directory, String contextFilename) {
@@ -52,7 +50,19 @@ public final class ConversationHistory {
         this(directory, contextFilename, clock, true);
     }
 
+    public ConversationHistory(Path directory, String contextFilename, boolean enabled,
+            boolean registerContext) {
+        this(directory, contextFilename, Clock.systemDefaultZone(), enabled, registerContext);
+    }
+
     private ConversationHistory(Path directory, String contextFilename, Clock clock, boolean enabled) {
+        this(directory, contextFilename, clock, enabled, true);
+    }
+
+    private ConversationHistory(Path directory, String contextFilename, Clock clock,
+            boolean enabled, boolean registerContext) {
+        this.registerContext = registerContext;
+
         this.directory = WorkingDirectoryPaths.canonical(directory);
         this.paths = new WorkingDirectoryPaths(this.directory);
         this.contextFilename = contextFilename == null ? "context.json" : contextFilename;
@@ -121,6 +131,7 @@ public final class ConversationHistory {
 
     /** Reconcile even existing files, including a prior crash before registration. */
     private void register(String filename) throws IOException {
+        if (!registerContext) return;
         Path config = paths.contextFile(new ContextFile(contextFilename, FileAccess.READ_WRITE));
         byte[] original = Files.notExists(config, LinkOption.NOFOLLOW_LINKS)
                 ? null : WorkingDirectoryPaths.read(config);
@@ -152,29 +163,13 @@ public final class ConversationHistory {
 
     private void replaceContext(Path config, byte[] original, byte[] replacement) throws IOException {
         paths.contextFile(new ContextFile(contextFilename, FileAccess.READ));
-        Path temporary = Files.createTempFile(config.getParent(), ".ciop-history-", ".tmp");
-        try {
-            try (FileChannel channel = FileChannel.open(temporary, StandardOpenOption.WRITE)) {
-                write(channel, replacement);
-                channel.force(true);
-            }
+        AtomicFileReplacement.replace(config, replacement, ".ciop-history-", true, () -> {
             paths.contextFile(new ContextFile(contextFilename, FileAccess.READ_WRITE));
             byte[] current = Files.notExists(config, LinkOption.NOFOLLOW_LINKS)
                     ? null : WorkingDirectoryPaths.read(config);
             if (!Arrays.equals(original, current))
                 throw new IOException("Context changed while registering conversation history: " + contextFilename);
-            var permissions = Files.getFileAttributeView(config,
-                    java.nio.file.attribute.PosixFileAttributeView.class, LinkOption.NOFOLLOW_LINKS);
-            if (permissions != null)
-                Files.setPosixFilePermissions(temporary, permissions.readAttributes().permissions());
-            try {
-                Files.move(temporary, config, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            } catch (AtomicMoveNotSupportedException exception) {
-                Files.move(temporary, config, StandardCopyOption.REPLACE_EXISTING);
-            }
-        } finally {
-            Files.deleteIfExists(temporary);
-        }
+        });
     }
 
     private static void write(FileChannel channel, byte[] bytes) throws IOException {
@@ -183,12 +178,8 @@ public final class ConversationHistory {
     }
 
     private static String text(byte[] bytes) {
-        try {
-            String text = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString();
-            return text.chars().anyMatch(ch -> Character.isISOControl(ch)
-                    && ch != '\n' && ch != '\r' && ch != '\t') ? null : text;
-        } catch (CharacterCodingException exception) {
-            return null;
-        }
+        String text = Encoding.strictUtf8(bytes);
+        return text == null || text.chars().anyMatch(ch -> Character.isISOControl(ch)
+                && ch != '\n' && ch != '\r' && ch != '\t') ? null : text;
     }
 }

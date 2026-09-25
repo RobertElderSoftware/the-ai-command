@@ -2,7 +2,7 @@
 
 ## 1. Scope
 
-CIOP/1.0 marshals stdin and files to a model and unmarshals a single JSON array of operations. Supported output operations print bytes, overwrite a writable file, or patch selected lines of a writable UTF-8 file.
+CIOP/1.0 marshals stdin and files to a model and unmarshals a single JSON array of operations. Supported output operations print bytes, overwrite a writable file, patch selected lines of a writable UTF-8 file, or delete a writable file.
 
 The protocol is byte-safe, length-delimited, verifiable, and extensible. Input files and output paths are relative to the application's working directory. Implementations must reject absolute paths, parent traversal, symlinks, and paths resolving outside that directory. Paths must not contain control characters or the header delimiter `---`.
 
@@ -18,7 +18,7 @@ FILE sections have this header:
 
 `---SECTION FILE <encoding> <length> <sha256> access=<READ|READ_WRITE> path=<path>---`
 
-Encoding is `utf-8`, `base64`, or, for a nonexistent writable file, `missing`. Length and SHA-256 describe decoded raw bytes. A missing file has length zero, the SHA-256 of empty bytes, and an empty payload. FILE paths retain the exact spelling of their first included entry. The path is the last metadata field and extends to the closing header delimiter; spaces in filenames are allowed. Access is mandatory: READ means read-only; READ_WRITE permits file_write and file_patch, subject to their other rules. Never modify a READ file.
+Encoding is `utf-8`, `base64`, or, for a nonexistent writable file, `missing`. Length and SHA-256 describe decoded raw bytes. A missing file has length zero, the SHA-256 of empty bytes, and an empty payload. FILE paths retain the exact spelling of their first included entry. The path is the last metadata field and extends to the closing header delimiter; spaces in filenames are allowed. Access is mandatory: READ means read-only; READ_WRITE permits file_write, file_patch, and file_delete, subject to their other rules. Never modify or delete a READ file.
 
 Payload boundaries are determined by byte length, not by searching for marker text. UTF-8 lengths count encoded bytes, not characters. Base64 payload length is derived from the decoded byte length. A framing newline and `---END SECTION---` follow the payload. Marker-like text or non-text bytes may be transmitted using base64. Verify decoded bytes using the declared length and SHA-256.
 
@@ -110,24 +110,46 @@ Rules:
 
 Insertion before line 2 uses old_start:2, old_count:0, new_start:2, new_count:1, with one add line. Deletion uses one or more remove lines and new_count:0. Multiple hunks are evaluated in order against the original file while the result is built.
 
+### 3.4 file_delete
+
+`{"op":"file_delete","path":"notes.txt"}`
+
+This deletes a writable file. Required fields are `op` and `path`; there is no encoded payload. `path` must exactly match a transmitted READ_WRITE FILE path from the context configuration or command-line arguments. READ files, reserved paths, directories, symlinks, and paths outside the working directory cannot be deleted. Deletion is never recursive. Deleting an absent file is allowed and leaves it absent.
+
+### 3.5 file_patch_binary
+
+This additional operation inserts, deletes, or replaces bytes without text decoding or context lines. READ_WRITE permits file_patch_binary under the same exact-path allowlisting, READ protection, containment, and no-symlink rules as file_patch.
+
+Example shape (replace the hash placeholder with the source file's actual SHA-256):
+
+```json
+{"op":"file_patch_binary","path":"data.bin","source_sha256":"<64 hexadecimal characters>","hunks":[{"offset":16,"remove_count":2,"encoding":"base64","data":"AP8="}]}
+```
+
+Required fields are op, path, source_sha256, and a nonempty hunks array. Optional result_sha256 verifies the complete resulting bytes. Each hunk requires offset, remove_count, encoding (base64 only), and data. Use remove_count:0 for insertion, empty data for deletion, or both removal and data for replacement.
+
+Offsets are zero-based byte positions in the source at the start of this operation, before any of its hunks. Counts and offsets must be nonnegative integers representable in a signed 32-bit integer. Hunks must be ordered and non-overlapping: each offset must be at least the previous offset plus its remove_count. Insertions at the same offset are concatenated in array order. Insertion at EOF is allowed, including offset zero in an empty file. Removal must remain within the source. Untouched bytes are preserved exactly; no newline normalization occurs. Invalid base64, bounds, hashes, or hunk structure reject the entire batch.
+
+The target must exist as a regular file in the staged view. Earlier writes or patches supply its source bytes; deletion makes it unavailable until recreated by a write. Later operations observe the binary patch result. Binary patches use the same validation-before-commit, snapshot checks, rollback, and buffered stdout publication as other file operations. This implementation constructs the result in memory and rejects intermediate results exceeding Integer.MAX_VALUE bytes. Use file_patch_binary for precise byte edits to binary or text files; offsets always count bytes, not characters.
+
 ## 4. Ordering and safety
 
-A patch following a write or earlier patch observes the preceding staged result, so its source_sha256 must describe that state. Multiple stdout operations concatenate their bytes.
+A patch following a write or earlier patch observes the preceding staged result, so its source_sha256 must describe that state. A write followed by deletion leaves the file absent; deletion followed by a write recreates it. A patch after deletion fails unless an intervening write recreates the file. Multiple stdout operations concatenate their bytes.
 
-Implementations enforce READ/READ_WRITE permissions, exact writable-path allowlisting, canonical containment, and no-symlink checks for both file_write and file_patch. Aliases must not bypass READ protection. Reserved protocol paths are never writable. File permissions are enforced by the application, independently of model compliance.
+Implementations enforce READ/READ_WRITE permissions, exact writable-path allowlisting, canonical containment, and no-symlink checks for file_write, file_patch, and file_delete. Aliases must not bypass READ protection. Reserved protocol paths are never writable or deletable. File permissions are enforced by the application, independently of model compliance.
 
 ### 4.1 Batch validation and recovery
 
-The complete response is parsed and validated against an in-memory file view before destination files, directories, or stdout change. A file created by an earlier file_write can be patched later in the batch. Normalized aliases share staged content; distinct hard-linked destinations and conflicting file/directory destinations are rejected.
+The complete response is parsed and validated against an in-memory file view before destination files, directories, or stdout change. A file created by an earlier file_write can be patched or deleted later in the batch. Normalized aliases share staged content; distinct hard-linked destinations and conflicting file/directory destinations are rejected.
 
-Original bytes and file identities are rechecked before commit. Each destination receives its final staged bytes once. Existing files use sibling temporary replacement and atomic move where supported, preserving POSIX permission bits where supported; other metadata and hard-link relationships are not guaranteed to be preserved. Staging and recovery snapshots remain in memory. Ordinary commit failures trigger best-effort restoration of attempted destinations, deletion of newly created files, and removal of empty directories created by the batch. Recovery failures are reported individually. This is not crash-safe multi-file atomicity, and external concurrent modifications remain a race.
+Original bytes and file identities are rechecked before commit. Each destination receives its final staged state once: its final bytes are written, or it is deleted if its final state is absent. Existing files being written use sibling temporary replacement and atomic move where supported, preserving POSIX permission bits where supported; other metadata and hard-link relationships are not guaranteed to be preserved. Staging and recovery snapshots remain in memory. Ordinary commit failures trigger best-effort restoration of attempted destinations, including the original bytes of deleted files, deletion of newly created files, and removal of empty directories created by the batch. Restoration of deleted files does not guarantee preservation of filesystem metadata. Recovery failures are reported individually. This is not crash-safe multi-file atomicity, and external concurrent modifications remain a race.
 
 Stdout is buffered in operation order and published only after successful file commits. An output failure reports that files were committed and stdout may be incomplete; it does not roll back committed files. Never automatically retry such a batch. Prompt and response logging remains independent of staging and may occur even when validation rejects the batch.
 
 ## 5. Verification failures
 
-Input length or hash failures should produce a stdout operation explaining the mismatch and avoid unsafe writes. Output length, output hash, patch source hash, patch content, or patch result hash failures reject the complete batch during validation without destination-file or stdout effects.
+Input length or hash failures should produce a stdout operation explaining the mismatch and avoid unsafe writes or deletions. Output length, output hash, patch source hash, patch content, or patch result hash failures reject the complete batch during validation without destination-file or stdout effects.
 
 ## 6. Guidance for models
 
-Return only the JSON array. Use stdout for user-facing text. Use file_write for new files, binary files, or whole-file replacement. Use file_patch for a small line-oriented edit to an existing UTF-8 file. Copy context and removed lines exactly from the supplied FILE section. Keep hunks simple, ordered, and non-overlapping. Only READ_WRITE files may be changed, and output paths must exactly match their transmitted paths. The built-in protocol document is always READ-only.
+Return only the JSON array. Use stdout for user-facing text. Use file_write for new files, binary files, or whole-file replacement. Use file_patch for a small line-oriented edit to an existing UTF-8 file. Use file_delete to delete an allowed writable file. Copy context and removed lines exactly from the supplied FILE section. Keep hunks simple, ordered, and non-overlapping. Only READ_WRITE files may be changed or deleted, and output paths must exactly match their transmitted paths. The built-in protocol document is always READ-only.

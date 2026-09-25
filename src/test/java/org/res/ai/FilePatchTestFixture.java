@@ -21,6 +21,47 @@ public final class FilePatchTestFixture {
         this.context = context;
     }
 
+    public void binaryRegressions() throws Exception {
+        String path = "binary.dat";
+        byte[] source = {0, (byte) 255, 2, 3, 4};
+        byte[] expected = {9, 0, 8, 7, 3};
+        Files.write(context.resolve(path), source);
+        JsonObject patch = object("op", "file_patch_binary", "path", path,
+                "source_sha256", sha256(source), "result_sha256", sha256(expected),
+                "hunks", lines(binaryHunk(0, 0, "CQ=="), binaryHunk(1, 2, "CAc="),
+                        binaryHunk(4, 1, "")));
+        context.execute(patch, Set.of(path));
+        assertArrayEquals(expected, Files.readAllBytes(context.resolve(path)));
+        Files.write(context.resolve(path), source);
+        assertThrows(IllegalArgumentException.class, () -> context.execute(patch, Set.of()));
+        for (JsonObject bad : new JsonObject[] {
+                object("source_sha256", "0".repeat(64)),
+                object("result_sha256", "0".repeat(64)),
+                object("hunks", lines(binaryHunk(6, 0, ""))),
+                object("hunks", lines(binaryHunk(4, 2, ""))),
+                object("hunks", lines(binaryHunk(2, 2, ""), binaryHunk(3, 0, ""))),
+                object("hunks", lines(binaryHunk(-1, 0, ""))),
+                object("hunks", lines(binaryHunk(0.5, 0, ""))),
+                object("hunks", lines(binaryHunk(4294967296L, 0, ""))),
+                object("hunks", lines(binaryHunk(0, 0, "!"))),
+                object("hunks", lines())}) {
+            JsonObject invalid = patch.deepCopy();
+            bad.entrySet().forEach(entry -> invalid.add(entry.getKey(), entry.getValue()));
+            assertRejected(invalid, path, source, "file_patch_binary");
+        }
+        JsonObject append = object("op", "file_patch_binary", "path", path,
+                "source_sha256", sha256(new byte[0]), "hunks", lines(binaryHunk(0, 0, "AP8=")));
+        Files.write(context.resolve(path), new byte[0]);
+        context.execute(append, Set.of(path));
+        assertArrayEquals(new byte[] {0, (byte) 255}, Files.readAllBytes(context.resolve(path)));
+        Files.delete(context.resolve(path));
+        assertThrows(IllegalArgumentException.class, () -> context.execute(append, Set.of(path)));
+    }
+
+    private static JsonObject binaryHunk(Number offset, int remove, String data) {
+        return object("offset", offset, "remove_count", remove, "encoding", "base64", "data", data);
+    }
+
     public void replacement() throws Exception {
         test("patch-replace-", "one\ntwo\nthree\n", 2, 1, 2, 1,
                 lines(line("remove", "two"), line("add", "TWO")),

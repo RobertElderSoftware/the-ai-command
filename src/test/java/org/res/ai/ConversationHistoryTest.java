@@ -54,10 +54,109 @@ class ConversationHistoryTest {
                         ConversationHistoryTest::historyAndContextPathsRejectSymlinksTraversalAndReservedNames),
                 InputSpacePartitionTestNode.fixtureLeaf("literal_and_legacy",
                         ConversationHistoryTest::readableBlocksPreserveLiteralTextAndLegacyEntries),
+                InputSpacePartitionTestNode.fixtureLeaf("ignored_context",
+                        ConversationHistoryTest::contextCanBeIgnored),
+                InputSpacePartitionTestNode.fixtureLeaf("recording_enabled",
+                        ConversationHistoryTest::recordingCanBeExplicitlyEnabled),
                 InputSpacePartitionTestNode.fixtureLeaf("timestamp_metadata",
                         ConversationHistoryTest::timestampEventsOmitPayloadMetadataButEmptyPayloadsRetainIt)),
                 ConversationHistoryTest::new, fixture -> fixture.directory);
     }
+
+    void recordingCanBeExplicitlyEnabled() throws Exception {
+        assertTrue(TheAICommand.parseOptions(new String[] {"--enable-conversation-history"},
+                new ArrayList<>()).containsKey("--enable-conversation-history"));
+        for (String[] args : List.of(
+                new String[] {"--enable-conversation-history=true"},
+                new String[] {"--enable-conversation-history", "--disable-conversation-history"},
+                new String[] {"--disable-conversation-history", "--enable-conversation-history"}))
+            assertThrows(IllegalArgumentException.class,
+                    () -> TheAICommand.parseOptions(args, new ArrayList<>()));
+        for (boolean ignoreContext : List.of(false, true)) {
+            Path work = Files.createDirectory(directory.resolve("enabled-" + ignoreContext));
+            String config = ignoreContext ? "not JSON" : contextJson();
+            Files.writeString(work.resolve("custom.json"), config);
+            CapturingLLMProvider provider = new CapturingLLMProvider("[]");
+            try (AICommandApplication app = new AICommandApplication(provider, new ByteArrayOutputStream(), work)) {
+                for (int request = 0; request < 2; request++)
+                    app.runWithHistory("saved".getBytes(StandardCharsets.UTF_8), List.of(),
+                            "custom.json", false, ignoreContext, true);
+            }
+            assertEquals(2, provider.calls());
+            assertEquals(List.of("user", "request_sent", "response_received", "applied",
+                    "user", "request_sent", "response_received", "applied"), events(work));
+            assertEquals("saved", records(work).get(0).get("data").getAsString());
+            if (ignoreContext) assertEquals(config, Files.readString(work.resolve("custom.json")));
+            else assertTrue(RequestContext.load(work, "custom.json").files().stream()
+                    .allMatch(entry -> entry.access() == FileAccess.READ));
+            assertEquals(!ignoreContext, provider.prompt().contains("access=READ path=conversation_history/"));
+        }
+        Path work = Files.createDirectory(directory.resolve("enabled-no-context"));
+        CapturingLLMProvider provider = new CapturingLLMProvider("[]");
+        try (AICommandApplication app = new AICommandApplication(provider, new ByteArrayOutputStream(), work)) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> app.runWithHistory(new byte[0], List.of(), null, true, false, true));
+            assertFalse(Files.exists(work.resolve(ConversationHistory.DIRECTORY)));
+            assertEquals(0, provider.calls());
+            app.runWithHistory(new byte[0], List.of(), null, false, false, true);
+        }
+        assertFalse(Files.exists(work.resolve("context.json")));
+        assertEquals(List.of("user", "request_sent", "response_received", "applied"), events(work));
+        Path outside = Files.createDirectory(directory.resolve("enable-outside"));
+        for (boolean symlink : List.of(false, true)) {
+            Path unsafe = Files.createDirectory(directory.resolve("enable-unsafe-" + symlink));
+            Path target = unsafe.resolve(ConversationHistory.DIRECTORY);
+            if (symlink) Files.createSymbolicLink(target, outside);
+            else Files.writeString(target, "preserved");
+            CapturingLLMProvider unused = new CapturingLLMProvider("[]");
+            try (AICommandApplication app = new AICommandApplication(unused, new ByteArrayOutputStream(), unsafe)) {
+                if (symlink) assertThrows(IllegalArgumentException.class,
+                        () -> app.runWithHistory(new byte[0], List.of(), null, false, false, true));
+                else assertThrows(IOException.class,
+                        () -> app.runWithHistory(new byte[0], List.of(), null, false, false, true));
+            }
+            assertEquals(0, unused.calls());
+            if (symlink) assertTrue(Files.isSymbolicLink(target));
+            else assertEquals("preserved", Files.readString(target));
+        }
+        try (var files = Files.list(outside)) {
+            assertEquals(0, files.count());
+        }
+    }
+
+
+    void contextCanBeIgnored() throws Exception {
+        assertTrue(TheAICommand.parseOptions(new String[] {"--ignore-context"},
+                new ArrayList<>()).containsKey("--ignore-context"));
+        assertThrows(IllegalArgumentException.class, () -> TheAICommand.parseOptions(
+                new String[] {"--ignore-context=true"}, new ArrayList<>()));
+        for (String filename : List.of("context.json", "custom.json")) {
+            Path work = Files.createDirectory(directory.resolve(filename + "-work"));
+            Files.createDirectory(work.resolve(ConversationHistory.DIRECTORY));
+            Files.writeString(work.resolve("reference.txt"), "context only");
+            for (String config : List.of(contextJson(read("reference.txt")), "not JSON")) {
+                Files.writeString(work.resolve(filename), config);
+                CapturingLLMProvider provider = new CapturingLLMProvider(
+                        batch(fileWrite("result.txt", "answer"), stdout("visible")));
+                ByteArrayOutputStream output = new ByteArrayOutputStream();
+                try (AICommandApplication app = new AICommandApplication(provider, output, work)) {
+                    app.runWithHistory(new byte[0], List.of("result.txt"),
+                            filename.equals("context.json") ? null : filename, false, true);
+                }
+                assertEquals(config, Files.readString(work.resolve(filename)));
+                assertEquals("answer", Files.readString(work.resolve("result.txt")));
+                assertEquals("visible", output.toString(StandardCharsets.UTF_8));
+                assertEquals(1, provider.calls());
+                assertFalse(provider.prompt().contains("path=reference.txt---"));
+                assertFalse(provider.prompt().contains("path=conversation_history/"));
+                assertTrue(provider.prompt().contains("access=READ_WRITE path=result.txt---"));
+            }
+            assertEquals(List.of("user", "request_sent", "response_received", "stdout", "applied",
+                    "user", "request_sent", "response_received", "stdout", "applied"),
+                    events(work));
+        }
+    }
+
 
     void recordingCanBeSkipped() throws Exception {
         assertTrue(TheAICommand.parseOptions(new String[] {"--disable-conversation-history"},

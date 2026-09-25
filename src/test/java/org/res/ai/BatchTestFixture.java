@@ -50,6 +50,21 @@ public final class BatchTestFixture {
                 }),
                 rejected("conflict", f -> new JsonObject[] {
                         f.write, fileWrite("target.txt/child", "new\n")}),
+                leaf("delete_recreate", null, null, "new\n", null, "", f ->
+                        new JsonObject[] {object("op", "file_delete", "path", "target.txt"), f.write}),
+                leaf("create_delete", null, null, "original\n", null, "", f ->
+                        new JsonObject[] {f.create, object("op", "file_delete", "path", CREATED)}),
+                rejected("delete_patch", f -> new JsonObject[] {
+                        object("op", "file_delete", "path", "target.txt"),
+                        replaceFirstLine("target.txt", "original\n", "original", "patched")}),
+                rejected("delete_invalid_batch", f -> new JsonObject[] {
+                        object("op", "file_delete", "path", "target.txt"),
+                        object("op", "file_delete", "path", "not-allowed.txt")}),
+                leaf("delete_rollback", IOException.class, "rollback completed", "original\n", null, "", f -> {
+                    f.failCommit = true;
+                    return new JsonObject[] {object("op", "file_delete", "path", "target.txt"),
+                            f.create, f.outputOp};
+                }),
                 leaf("chain", null, null, "patched\n", null, "visiblevisible", f ->
                         new JsonObject[] {f.write,
                                 replaceFirstLine("./target.txt", "new\n", "new", "patched"),

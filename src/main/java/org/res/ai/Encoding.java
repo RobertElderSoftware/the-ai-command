@@ -1,5 +1,7 @@
 package org.res.ai;
 
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 
@@ -22,6 +24,13 @@ public enum Encoding {
         return this == UTF_8
                 ? new String(data, StandardCharsets.UTF_8)
                 : Base64.getEncoder().encodeToString(data);
+    }
+
+    /** Returns null for invalid UTF-8; a new decoder reports malformed input by default. */
+    static String strictUtf8(byte[] bytes) {
+        try {
+            return StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString();
+        } catch (CharacterCodingException exception) { return null; }
     }
 
     public static Encoding fromToken(String token) {
