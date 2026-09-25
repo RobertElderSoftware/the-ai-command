@@ -45,10 +45,16 @@ mvn clean package
 
 #  Run
 
-You can run the program like this:
+Once you have the 'ai' command set up in your path, you can run it like this:
 
 ```
-ai "This is my prompt." | java -jar /home/robert/2026-09-04-ai/target/the-ai-command.jar file1.txt File2.java
+echo "This is my prompt." | ai file1.txt File2.java
+```
+
+If you haven't yet set it up to run as a simple script called 'ai' (see below), you'll have to run it like this:
+
+```
+echo "This is my prompt." | java -jar /home/robert/2026-09-04-ai/target/the-ai-command.jar file1.txt File2.java
 ```
 
 #  Example 'ai' script, located at '~/roberts-ai/ai'
