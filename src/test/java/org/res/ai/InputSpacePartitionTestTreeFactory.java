@@ -17,7 +17,8 @@ public final class InputSpacePartitionTestTreeFactory {
                 BatchTestFixture.space(parent), new RequestContextTest().space(parent),
                 ConversationHistoryTest.space(parent),
                 AICommandApplicationTest.loggingSpace(parent),
-                AICommandApplicationTest.patchRegressionSpace(parent)));
+                AICommandApplicationTest.patchRegressionSpace(parent),
+                SubsetPartitionTest.space(parent)));
     }
 
     static List<InputSpacePartitionTestSpace<?>> validateSpaces(
@@ -83,7 +84,11 @@ public final class InputSpacePartitionTestTreeFactory {
                     var traversal = TestJson.object("op", "file_delete", "path", "../outside.txt");
                     org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
                             () -> context.execute(traversal, java.util.Set.of("../outside.txt")));
-                })));
+                }),
+                fixtureLeaf("list_files", (context, execution) ->
+                        AvailableFilesTest.followUp(context.resolve("."))),
+                fixtureLeaf("change_contexts", (context, execution) ->
+                        ChangeContextsTest.followUp(context.resolve(".")))));
 
         PathCheck input = (context, fixture, path) ->
                 context.assertInputRejected(fixture.workingDirectory(), path);

@@ -27,7 +27,17 @@ public final class TestJson {
     public static String batch(JsonObject... operations) { return lines(operations).toString(); }
     public static JsonObject read(String path) { return object(path, FileAccess.READ.name()); }
     public static JsonObject readWrite(String path) { return object(path, FileAccess.READ_WRITE.name()); }
-    public static String contextJson(JsonObject... files) { return object("files", lines(files)).toString(); }
+    /** Existing fixtures explicitly permit extra argument/output files after their specific rules. */
+    public static String contextJson(JsonObject... files) {
+        JsonArray contexts = new JsonArray();
+        JsonArray permissions = new JsonArray();
+        for (JsonObject file : files) {
+            file.keySet().forEach(contexts::add);
+            permissions.add(file.deepCopy());
+        }
+        permissions.add(readWrite("regex:.*"));
+        return object("contexts", contexts, "permissions", permissions).toString();
+    }
 
     public static JsonObject operation(OperationType type, String path, Encoding encoding, byte[] data) {
         JsonObject result = object("op", type.opcode(), "encoding", encoding.token(), "data", encoding.encode(data));

@@ -27,6 +27,7 @@ public final class TheAICommand {
         descriptions.put("--backend", "Choose codex, openai, or loopback.");
         descriptions.put("--model", "Choose the model used by the openai backend.");
         descriptions.put("--context", "Load ordered files and READ/READ_WRITE permissions from a JSON file.");
+        descriptions.put("--enable-context", "Alias for --context; defaults to context.json when no filename is supplied.");
         return descriptions;
     }
 
@@ -73,19 +74,37 @@ public final class TheAICommand {
         System.out.println();
         DESCRIPTIONS.forEach((name, description) -> {
             String defaultValue = DEFAULTS.get(name);
-            System.out.println("  " + name + (VALUE_OPTIONS.contains(name) ? " <value>" : "")
+            System.out.println("  " + name + (name.equals("--enable-context") ? " [file]"
+                    : VALUE_OPTIONS.contains(name) ? " <value>" : "")
                     + "  " + description
                     + (defaultValue == null ? "" : " Default: " + defaultValue + "."));
         });
         System.out.println("  --  End option parsing; all following arguments are file paths.");
         System.out.println();
         System.out.println("Value options accept --name value or --name=value; the last value wins.");
-        System.out.println("Context example: {\"files\":[{\"README.md\":\"READ\"},{\"src/example.txt\":\"READ_WRITE\"}]}");
+        System.out.println("--enable-context accepts an optional filename or =filename; context aliases share the last supplied value.");
+        System.out.println("Bare --enable-context selects context.json. Use --enable-context -- files... to keep following files as inputs.");
+        System.out.println("Context example: {\"contexts\":[\"README.md\"],\"permissions\":[{\"README.md\":\"READ\"},{\"regex:src/.*\":\"READ_WRITE\"}]}");
+        System.out.println("Context entries may be filename strings for whole files or objects selecting line or byte ranges.");
+        System.out.println("Line selection example: {\"path\":\"src/example.java\",\"lines\":[[10,20],[45,45]]}");
+        System.out.println("Byte selection example: {\"path\":\"data.bin\",\"bytes\":[[0,16],[4096,1]]}");
+        System.out.println("Lines use one-based inclusive [first,last]; bytes use zero-based [offset,count] with positive counts.");
+        System.out.println("Ranges must be nonempty, ordered, non-overlapping, and within an existing file; adjacent ranges are allowed.");
+        System.out.println("Use exactly one of lines or bytes. Line selections require the entire source to be valid UTF-8.");
+        System.out.println("LF delimits lines; CRLF and selected terminators are preserved. Bare CR is content; trailing LF adds no extra line.");
+        System.out.println("Command-line duplicates retain the configured subset. History registration also preserves existing excerpts.");
+        System.out.println("Selections do not restrict READ_WRITE permission: whole-file replacement from an excerpt is permitted.");
+        System.out.println("To request a whole file already selected as an excerpt: {\"op\":\"change_contexts\",\"add\":[],\"remove\":[],\"update\":[\"src/example.java\"]}");
+        System.out.println("The update array also accepts subset objects and preserves entry order; add never replaces an existing selection.");
+        System.out.println("CIOP/1.1 retains string-only configurations and ordinary output operations; CIOP/1.0 harnesses cannot handle subsets.");
+        System.out.println("Permission rules match normalized relative paths in order; the first match wins and no match denies access.");
         System.out.println("Without --context, context.json in the working directory is used.");
         System.out.println("Context paths and command-line files are relative to the working directory.");
         System.out.println("The embedded read-only CIOP document comes first, then context files, extra files, and stdin.");
         System.out.println("Duplicate context files are errors. Argument duplicates retain context permissions.");
-        System.out.println("Additional command-line files allow writes. Missing READ_WRITE files may be created.");
+        System.out.println("With a context configuration, command-line files require permission and never grant access.");
+        System.out.println("Without a loaded configuration, explicit command-line files retain READ_WRITE access.");
+        System.out.println("Permissions can authorize output files absent from contexts. Missing READ_WRITE files may be created.");
         System.out.println("READ files must exist. Absolute paths, '..', symlinks, and __ciop__ paths are rejected.");
         System.out.println("Unrecognized arguments are treated as file paths; use -- for option-like filenames.");
         System.out.println("The openai backend requires OPENAI_API_KEY; codex requires the codex executable.");
@@ -112,6 +131,13 @@ public final class TheAICommand {
             String name = equals < 0 ? argument : argument.substring(0, equals);
             if (!options || !DESCRIPTIONS.containsKey(name)) {
                 files.add(argument);
+            } else if (name.equals("--enable-context")) {
+                String value = equals >= 0 ? argument.substring(equals + 1)
+                        : index + 1 < args.length && !args[index + 1].startsWith("--")
+                        ? args[++index] : DEFAULTS.get("--context");
+                if (value.isBlank())
+                    throw new IllegalArgumentException(name + " requires a nonblank filename when supplied");
+                values.put("--context", value);
             } else if (!VALUE_OPTIONS.contains(name)) {
                 if (equals >= 0) throw new IllegalArgumentException(name + " does not accept a value");
                 values.put(name, "true");

@@ -30,8 +30,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /** Routes prompts through an LLM provider and applies returned CIOP operations. */
 public class AICommandApplication implements AutoCloseable {
-    private static final String BEGIN = "---BEGIN CIOP/1.0---";
-    private static final String END = "---END CIOP/1.0---";
+    private static final String BEGIN = "---BEGIN CIOP/1.1---";
+    private static final String END = "---END CIOP/1.1---";
     private static final String END_SECTION = "---END SECTION---";
     private static final DateTimeFormatter LOG_TS = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss.SSS").withZone(ZoneId.systemDefault());
     private static final AtomicInteger LOG_SEQ = new AtomicInteger(1);
@@ -130,7 +130,7 @@ public class AICommandApplication implements AutoCloseable {
         for (int index = 0; index < files.size(); index++) {
             ContextFile file = files.get(index);
             if (history != null && history.protects(resolve(file.path()))) {
-                file = new ContextFile(file.path(), FileAccess.READ);
+                file = file.withAccess(FileAccess.READ);
                 files.set(index, file);
             }
             (file.access() == FileAccess.READ_WRITE ? writable : readOnly).add(file.path());
@@ -139,24 +139,27 @@ public class AICommandApplication implements AutoCloseable {
             readOnly.add(ConversationHistory.DIRECTORY);
             readOnly.add(history.contextFilename());
         }
-        executePrompt(buildPrompt(stdin == null ? new byte[0] : stdin, files), writable, readOnly, history);
+        executePrompt(buildPrompt(stdin == null ? new byte[0] : stdin, files, context),
+                context.hasPermissions() ? path -> context.canWrite(workingDirectory, path) : writable::contains,
+                readOnly, history, files, context, inputPaths == null ? List.of() : List.copyOf(inputPaths));
     }
 
     public void executePrompt(String prompt, Set<String> allowedFilePaths) throws IOException {
-        executePrompt(prompt, allowedFilePaths, Set.of(), null);
+        Set<String> allowed = allowedFilePaths == null ? Set.of() : Set.copyOf(allowedFilePaths);
+        executePrompt(prompt, allowed::contains, Set.of(), null, allowed.stream().sorted()
+                .map(path -> new ContextFile(path, FileAccess.READ_WRITE)).toList(), RequestContext.empty(), List.of());
     }
 
-    private void executePrompt(String prompt, Set<String> allowedFilePaths,
-            Set<String> readOnlyPaths, ConversationHistory history) throws IOException {
+    private void executePrompt(String prompt, java.util.function.Predicate<String> allowedFilePaths,
+            Set<String> readOnlyPaths, ConversationHistory history,
+            List<ContextFile> files, RequestContext context, List<String> arguments) throws IOException {
         String value = Objects.requireNonNull(prompt, "prompt");
-        log("prompt.txt", value);
-        provider.initialize();
-        if (history != null) history.sent();
-        String response = provider.complete(value);
-        log("response.txt", response);
-        if (history != null) history.received();
-        byte[] published = applyOperations(parseOperations(response),
-                allowedFilePaths == null ? Set.of() : Set.copyOf(allowedFilePaths), readOnlyPaths);
+        readOnlyPaths = new HashSet<>(readOnlyPaths);
+        if (context.sourceFilename() != null) readOnlyPaths.add(context.sourceFilename());
+        List<Operation> operations = requestOperations(value, readOnlyPaths, history, files, context, arguments);
+        byte[] published = applyOperations(operations,
+                // Discovery never changes the original write authorization.
+                allowedFilePaths, readOnlyPaths);
         if (history != null) {
             try {
                 if (published.length > 0) history.output(published);
@@ -166,6 +169,75 @@ public class AICommandApplication implements AutoCloseable {
                         + "Do not retry the batch automatically.", failure);
             }
         }
+    }
+
+    private List<Operation> requestOperations(String prompt, Set<String> readOnlyPaths,
+            ConversationHistory history, List<ContextFile> files, RequestContext context,
+            List<String> arguments) throws IOException {
+        String notice = null;
+        boolean contextCommitted = false;
+        provider.initialize();
+        try {
+            for (int followUps = 0; ; followUps++) {
+                log("prompt.txt", prompt);
+                if (history != null) history.sent();
+                if (notice != null) {
+                    stdout.write(("\u001b[32;4m" + notice + "\u001b[0m\n").getBytes(StandardCharsets.UTF_8));
+                    stdout.flush();
+                    if (stdout instanceof java.io.PrintStream stream && stream.checkError())
+                        throw new IOException("Could not publish the follow-up notice");
+                }
+                String response = provider.complete(prompt);
+                log("response.txt", response);
+                if (history != null) history.received();
+                List<Operation> operations = parseOperations(response);
+                boolean control = operations.stream().anyMatch(op ->
+                        op.type == OperationType.LIST_FILES || op.type == OperationType.CHANGE_CONTEXTS);
+                if (!control) return operations;
+                if (operations.size() != 1)
+                    throw new IllegalArgumentException("list_files or change_contexts must be the only operation; no batch operations were applied");
+                if (followUps >= 5) throw new IllegalArgumentException("Control follow-up limit exceeded (5)");
+                Operation operation = operations.get(0);
+                String input;
+                if (operation.type == OperationType.LIST_FILES) {
+                    if (history != null) history.listingRequested();
+                    String report = AvailableFiles.report(workingDirectory, context, files, readOnlyPaths);
+                    if (history != null) history.listingReport(report);
+                    input = "This is a listing of available files that the application harness has access to, "
+                            + "submitted in response to your list_files request.\n" + report;
+                    notice = "Sending the requested directory listing back to the LLM.";
+                } else {
+                    ChangeContexts.Result result = ChangeContexts.apply(
+                            workingDirectory, context, arguments, operation.data);
+                    contextCommitted = true;
+                    context = result.context();
+                    files = new ArrayList<>(result.files());
+                    for (int index = 0; index < files.size(); index++) {
+                        ContextFile file = files.get(index);
+                        if (history != null && history.protects(resolve(file.path()))) {
+                            file = file.withAccess(FileAccess.READ);
+                            files.set(index, file);
+                        }
+                        if (file.access() == FileAccess.READ) readOnlyPaths.add(file.path());
+                    }
+                    if (history != null) history.contextsChanged(result.report());
+                    input = "The local application processed your change_contexts request.\n"
+                            + result.report();
+                    notice = result.report() + "Sending the updated context back to the LLM.";
+                }
+                prompt = buildPrompt(input.getBytes(StandardCharsets.UTF_8), files, context);
+            }
+        } catch (IOException | RuntimeException failure) {
+            if (contextCommitted)
+                throw new IOException("Context changes were committed; a subsequent follow-up failed. "
+                        + "Do not retry the request automatically.", failure);
+            throw failure;
+        }
+    }
+
+    private static Operation listingOperation(JsonObject object) {
+        if (object.size() != 1) throw new IllegalArgumentException("list_files accepts only the op field");
+        return new Operation(OperationType.LIST_FILES, null, null, null, null, null);
     }
 
     private void log(String suffix, String text) {
@@ -178,11 +250,19 @@ public class AICommandApplication implements AutoCloseable {
         }
     }
 
-    private String buildPrompt(byte[] stdin, List<ContextFile> files) throws IOException {
+    private String buildPrompt(byte[] stdin, List<ContextFile> files, RequestContext context) throws IOException {
         StringBuilder result = new StringBuilder(BEGIN).append('\n');
         result.append(section("FILE", ProtocolDocument.bytes(),
                 "access=READ path=" + ProtocolDocument.PATH));
+        if (context.hasPermissions())
+            result.append(section("FILE", context.permissionsDocument().toString().getBytes(StandardCharsets.UTF_8),
+                    "access=READ path=" + RequestContext.PERMISSIONS_PATH));
         for (ContextFile entry : files) {
+            if (!entry.selection().isWhole()) {
+                result.append(SubsetEnvelope.read(new WorkingDirectoryPaths(workingDirectory), entry).section(entry));
+                continue;
+            }
+
             Path file = resolve(entry.path());
             String metadata = "access=" + entry.access() + " path=" + entry.path();
             if (Files.notExists(file, NO_FOLLOW) && entry.access() == FileAccess.READ_WRITE) {
@@ -206,7 +286,7 @@ public class AICommandApplication implements AutoCloseable {
                 + payload + "\n" + END_SECTION + "\n";
     }
 
-    private byte[] applyOperations(List<Operation> operations, Set<String> allowedPaths,
+    private byte[] applyOperations(List<Operation> operations, java.util.function.Predicate<String> allowedPaths,
             Set<String> readOnlyPaths) throws IOException {
         java.util.Map<Path, byte[]> originals = new java.util.LinkedHashMap<>();
         java.util.Map<Path, byte[]> staged = new java.util.LinkedHashMap<>();
@@ -242,6 +322,7 @@ public class AICommandApplication implements AutoCloseable {
     private byte[] calculateOperation(Operation operation, byte[] source) {
         return switch (operation.type) {
             case STDOUT, FILE_WRITE -> operation.decode();
+            case LIST_FILES, CHANGE_CONTEXTS -> throw new IllegalArgumentException("Control operations must be handled before batch application");
             case FILE_DELETE -> null;
             case FILE_PATCH, FILE_PATCH_BINARY -> {
                 if (source == null)
@@ -392,9 +473,9 @@ public class AICommandApplication implements AutoCloseable {
         }
     }
 
-    private static void requireAllowed(String path, Set<String> allowedPaths, String opcode) {
-        if (path == null || !allowedPaths.contains(path)) {
-            throw new IllegalArgumentException("Rejected " + opcode + " to non-allowlisted path: " + path);
+    private static void requireAllowed(String path, java.util.function.Predicate<String> allowedPaths, String opcode) {
+        if (path == null || !allowedPaths.test(path)) {
+            throw new IllegalArgumentException("Rejected " + opcode + ": write permission denied for path: " + path);
         }
     }
 
@@ -541,7 +622,7 @@ public class AICommandApplication implements AutoCloseable {
     private static List<Operation> parseOperations(String text) {
         final JsonElement root;
         try {
-            root = com.google.gson.JsonParser.parseString(text);
+            root = StrictJson.parse(text);
         } catch (JsonParseException exception) {
             throw new IllegalArgumentException("Model output was not valid JSON", exception);
         }
@@ -552,6 +633,8 @@ public class AICommandApplication implements AutoCloseable {
             JsonObject object = element.getAsJsonObject();
             OperationType type = OperationType.fromOpcode(requiredString(object, "op"));
             operations.add(switch (type) {
+                case LIST_FILES -> listingOperation(object);
+                case CHANGE_CONTEXTS -> ChangeContexts.operation(object);
                 case FILE_DELETE -> Operation.deletion(requiredString(object, "path"));
                 case FILE_PATCH_BINARY -> new Operation(requiredString(object, "path"), object);
                 case FILE_PATCH -> Operation.textPatch(parsePatch(object));

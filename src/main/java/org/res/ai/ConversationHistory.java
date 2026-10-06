@@ -36,6 +36,13 @@ public final class ConversationHistory {
     private final Clock clock;
     private final boolean enabled;
     private final boolean registerContext;
+    private boolean contextSelectionChanged;
+
+    public void contextsChanged(String report) throws IOException {
+        // Do not immediately re-add a history file explicitly removed this invocation.
+        contextSelectionChanged = true;
+        append("contexts_changed", report.getBytes(StandardCharsets.UTF_8));
+    }
     private final String requestId = UUID.randomUUID().toString();
 
     public ConversationHistory(Path directory, String contextFilename) {
@@ -131,34 +138,17 @@ public final class ConversationHistory {
 
     /** Reconcile even existing files, including a prior crash before registration. */
     private void register(String filename) throws IOException {
-        if (!registerContext) return;
+        if (!registerContext || contextSelectionChanged) return;
         Path config = paths.contextFile(new ContextFile(contextFilename, FileAccess.READ_WRITE));
         byte[] original = Files.notExists(config, LinkOption.NOFOLLOW_LINKS)
                 ? null : WorkingDirectoryPaths.read(config);
         if (original == null) return; // History never creates a context configuration.
         RequestContext context = RequestContext.load(directory, contextFilename);
-        JsonArray entries = new JsonArray();
-        boolean found = false;
-        boolean changed = false;
-        for (ContextFile entry : context.files()) {
-            boolean matches = WorkingDirectoryPaths.sameFile(paths.resolve(entry.path()), paths.resolve(filename));
-            FileAccess access = matches ? FileAccess.READ : entry.access();
-            found |= matches;
-            changed |= access != entry.access();
-            JsonObject item = new JsonObject();
-            item.addProperty(entry.path(), access.name());
-            entries.add(item);
-        }
-        if (!found) {
-            JsonObject item = new JsonObject();
-            item.addProperty(filename, FileAccess.READ.name());
-            entries.add(item);
-            changed = true;
-        }
-        if (!changed) return;
-        JsonObject document = new JsonObject();
-        document.add("files", entries);
-        replaceContext(config, original, (CONTEXT_JSON.toJson(document) + "\n").getBytes(StandardCharsets.UTF_8));
+        JsonObject document = context.withHistory(paths, filename);
+        if (document.equals(com.google.gson.JsonParser.parseString(
+                new String(original, StandardCharsets.UTF_8)))) return;
+        replaceContext(config, original,
+                (CONTEXT_JSON.toJson(document) + "\n").getBytes(StandardCharsets.UTF_8));
     }
 
     private void replaceContext(Path config, byte[] original, byte[] replacement) throws IOException {
@@ -182,4 +172,10 @@ public final class ConversationHistory {
         return text == null || text.chars().anyMatch(ch -> Character.isISOControl(ch)
                 && ch != '\n' && ch != '\r' && ch != '\t') ? null : text;
     }
+    /** Store a readable listing before constructing the JSON follow-up prompt. */
+    public void listingReport(String report) throws IOException {
+        if (enabled) append("list_files_report", ListingHistoryFormat.format(report).getBytes(StandardCharsets.UTF_8));
+    }
+
+    public void listingRequested() throws IOException { append("list_files_requested", null); }
 }

@@ -45,7 +45,7 @@ public final class Operation {
             Objects.requireNonNull(patch, "patch");
         } else if (type == OperationType.FILE_DELETE) {
             Objects.requireNonNull(path, "path");
-        } else {
+        } else if (type != OperationType.LIST_FILES) {
             Objects.requireNonNull(encoding, "encoding");
             Objects.requireNonNull(data, "data");
         }

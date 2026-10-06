@@ -6,7 +6,9 @@ public enum OperationType {
     FILE_WRITE("file_write"),
     FILE_PATCH("file_patch"),
     FILE_PATCH_BINARY("file_patch_binary"),
-    FILE_DELETE("file_delete");
+    FILE_DELETE("file_delete"),
+    LIST_FILES("list_files"),
+    CHANGE_CONTEXTS("change_contexts");
 
     private final String opcode;
 

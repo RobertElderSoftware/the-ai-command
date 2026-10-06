@@ -1,26 +1,52 @@
-# ChatGPT CLI Multi-Part I/O Protocol (CIOP) — Version 1.0
+# ChatGPT CLI Multi-Part I/O Protocol (CIOP) — Version 1.1
+
+## CIOP/1.1 partial context
+
+This section defines the active partial-context format and context-update contract. CIOP/1.1 retains whole-file configuration strings and ordinary output operations. Subset-specific length and hash rules below take precedence over the whole-file rules. A CIOP/1.0 harness does not support these extensions.
+
+### Context selection schema
+
+A contexts entry is either a filename string selecting the entire file, or an object containing exactly path and one of lines or bytes. Examples: {"path":"src/example.java","lines":[[10,20],[45,45]]} and {"path":"data.bin","bytes":[[0,16],[4096,1]]}. The path is a literal relative filename under the existing containment and permission rules. Unknown or duplicate object fields are rejected.
+Line pairs are [first,last], one-based and inclusive. Byte pairs are [offset,count], with a zero-based offset and positive count. Range arrays must be nonempty; every pair must contain exactly two JSON integers representable as signed 64-bit integers. Fractions, negative coordinates, zero line numbers, zero byte counts, reversed line ranges, and arithmetic overflow are rejected. Ranges must be ordered and non-overlapping; adjacent ranges are allowed and remain separate selections. Mixing line and byte ranges in one entry is rejected.
+All selected ranges must exist in the source; no clipping occurs. Subsets require an existing regular file, including for READ_WRITE selections. Missing READ_WRITE files remain valid whole-file selections. Empty files have no selectable positive-length ranges and must be selected using the filename string. Duplicate filesystem identities remain invalid even when their ranges differ.
+Line selection requires the entire source to be valid UTF-8. LF delimits lines; CR immediately preceding LF belongs to that terminator, and bare CR is content. Selected bytes include each selected line's original terminator, if present. Empty files have zero lines; a single LF terminates one empty line; trailing LF does not introduce another line. Mixed LF and CRLF endings and unterminated final lines are preserved exactly. Byte selection permits arbitrary bytes and may split UTF-8 characters or CRLF pairs.
+Selections do not narrow permissions: READ_WRITE authorizes operations on the entire file. Whole-file replacement based on a subset is permitted, including intentional removal of unseen content; fetching the complete file first is not required. Command-line duplicates preserve the configured selection rather than expanding it. History registration preserves existing subset objects, including deliberately selected history excerpts, while retaining READ protection.
+
+### Compact subset input envelope
+
+CIOP/1.1 uses ---BEGIN CIOP/1.1--- and ---END CIOP/1.1---. Whole-file, missing-file, permissions, and STDIN section layouts remain unchanged. A subset uses: ---SECTION FILE <parts-utf-8|parts-base64> <envelope_bytes> <source_sha256> source_bytes=<source_bytes> access=<READ|READ_WRITE> path=<path>---. The path remains the last metadata field. The normal framing newline and ---END SECTION--- follow the payload.
+The decoded inner envelope consists of one ASCII directory line terminated by LF, immediately followed by concatenated selected source bytes with no separators between parts. For lines, the directory is L;first,last,payload_bytes;first,last,payload_bytes. For bytes, it is B;offset,count;offset,count. There is at least one entry. Decimal numbers have no sign, spaces, or leading zeros except the number zero itself. Entries correspond exactly to the ordered configured ranges.
+For example, a source containing a\nb\nc\n with lines [[1,1],[3,3]] has inner envelope L;1,1,2;3,3,2 followed by LF and the bytes a\nc\n. Its decoded envelope length is 18 bytes, source_bytes is 6, and the header hash identifies all six source bytes. The directory line is metadata, not selected content.
+envelope_bytes counts the directory including its LF plus all selected bytes. source_bytes counts the entire original file. source_sha256 hashes the entire original file and can be used directly as a patch source_sha256. It does not hash the inner envelope and cannot be verified from an incomplete selection. Receivers verify decoded envelope length and directory boundaries; whole-file and STDIN hash verification remains unchanged. The framing newline is excluded from envelope_bytes.
+parts-utf-8 transmits the inner envelope literally only when it is valid UTF-8 and passes the existing safe-text checks. Otherwise parts-base64 encodes the entire inner envelope once, avoiding separate padding for small parts. Receivers decode the envelope before splitting its selected bytes using directory byte counts, never character counts or marker searches. This encoding decision does not change source byte coordinates.
+Hashing, source size, and extraction must use the same source read. Stream processing should retain selected content rather than the entire source where practical, while still reading all source bytes for hashing and, for line selections, UTF-8 validation. Detect invalid ranges and representation-size limits before contacting the provider. Diagnostics identify the filename and offending range. A source read is not an atomic filesystem snapshot; later patch validation still detects stale source hashes.
+
+### Context update contract
+
+change_contexts retains required add and remove arrays and gains an optional update array. add and update accept the same strings or subset objects as contexts; remove continues to accept filename strings removing the complete selection for that identity. update targets must already exist in the configured contexts array; their positions and original path spellings are preserved while their selections are replaced. A string update selects the entire file. An identical update is a reported no-op. Existing add and remove no-op behavior is retained; add never replaces a selection. Explicit command-line files remain included under the existing merge rules.
+Reject duplicate identities within or across action arrays. Preserve permissions, cumulative READ protections, context snapshot checks, and the shared five-follow-up limit. Validate prospective selections and follow-up file inputs before replacing configuration; failures leave configuration unchanged. Notices and history events describe changed selections concisely. Discovery continues to report whole-file sizes and effective permissions. Integration must preserve subset selections through parsing, merging, serialization, history registration, protection overrides, and follow-up prompt construction.
 
 ## 1. Scope
 
-CIOP/1.0 marshals stdin and files to a model and unmarshals a single JSON array of operations. Supported output operations print bytes, overwrite a writable file, patch selected lines of a writable UTF-8 file, or delete a writable file.
+CIOP/1.1 marshals stdin and whole or selected parts of files to a model and unmarshals a single JSON array of operations. Supported output operations print bytes, overwrite a writable file, patch selected lines or bytes of a writable file, delete a writable file, discover files, or change context selections.
 
 The protocol is byte-safe, length-delimited, verifiable, and extensible. Input files and output paths are relative to the application's working directory. Implementations must reject absolute paths, parent traversal, symlinks, and paths resolving outside that directory. Paths must not contain control characters or the header delimiter `---`.
 
 ## 2. Input envelope
 
-The complete prompt begins with `---BEGIN CIOP/1.0---` and ends with `---END CIOP/1.0---`. No instructions are appended outside the envelope.
+The complete prompt begins with `---BEGIN CIOP/1.1---` and ends with `---END CIOP/1.1---`. No instructions are appended outside the envelope.
 
 STDIN sections have this header:
 
 `---SECTION STDIN <encoding> <length> <sha256>---`
 
-FILE sections have this header:
+Whole-file FILE sections have this header; subset sections use the compact subset header specified above:
 
 `---SECTION FILE <encoding> <length> <sha256> access=<READ|READ_WRITE> path=<path>---`
 
 Encoding is `utf-8`, `base64`, or, for a nonexistent writable file, `missing`. Length and SHA-256 describe decoded raw bytes. A missing file has length zero, the SHA-256 of empty bytes, and an empty payload. FILE paths retain the exact spelling of their first included entry. The path is the last metadata field and extends to the closing header delimiter; spaces in filenames are allowed. Access is mandatory: READ means read-only; READ_WRITE permits file_write, file_patch, and file_delete, subject to their other rules. Never modify or delete a READ file.
 
-Payload boundaries are determined by byte length, not by searching for marker text. UTF-8 lengths count encoded bytes, not characters. Base64 payload length is derived from the decoded byte length. A framing newline and `---END SECTION---` follow the payload. Marker-like text or non-text bytes may be transmitted using base64. Verify decoded bytes using the declared length and SHA-256.
+Payload boundaries are determined by byte length, not by searching for marker text. UTF-8 lengths count encoded bytes, not characters. Base64 payload length is derived from the decoded byte length. A framing newline and `---END SECTION---` follow the payload. Marker-like text or non-text bytes may be transmitted using base64. Verify whole-file and STDIN decoded bytes using the declared length and SHA-256. For subsets, verify envelope length and directory boundaries; the hash identifies the complete source and cannot be verified from incomplete content.
 
 The first FILE is always the built-in, READ-only virtual document `__ciop__/CIOP_PROTOCOL_INSTRUCTIONS.txt`: this protocol specification, packaged as an application resource. It is not a project file or a writable destination. The entire `__ciop__` namespace is reserved. Read and follow this document when producing the response.
 
@@ -32,18 +58,21 @@ The optional `--context path` or `--context=path` argument loads a UTF-8 JSON do
 
 ```json
 {
-  "files": [
+  "contexts": ["README.md", "src/example.txt"],
+  "permissions": [
     {"README.md": "READ"},
     {"src/example.txt": "READ_WRITE"}
   ]
 }
 ```
 
-The only top-level field is the required `files` array. Each array entry contains exactly one filename and one explicit, case-sensitive access string: READ or READ_WRITE. Unknown access strings, nulls, malformed JSON, duplicate object members, and extra fields are errors. An empty context is `{"files":[]}`. Without --context, an empty context is used; there is no automatic context.json discovery.
+The required top-level arrays are `contexts` and `permissions`. `contexts` contains whole-file filename strings or subset objects in transmission order, following the context selection schema above. `permissions` contains ordered single-member objects mapping a selector to READ or READ_WRITE. Bare selectors are literal relative paths; selectors beginning with `regex:` use the remainder as a Java regular expression. For example, {"regex:src/.*": "READ_WRITE"} authorizes paths under src. Expressions match the entire normalized relative path, using / separators. The first matching rule wins; no matching rule denies access. An empty configuration is {"contexts":[],"permissions":[]}. Unknown fields, duplicate object members, invalid expressions, nulls, and malformed entries are rejected.
+
+When configuration is loaded, a virtual READ file `__ciop__/PERMISSIONS.json` follows the protocol document and contains its ordered permission rules. These rules authorize output paths independently of context inclusion. A permitted output need not have a FILE section. All targets still undergo containment, reserved-namespace, READ-protection, and no-symlink checks. Without this virtual permission document, outputs must exactly match transmitted READ_WRITE paths. The CLI defaults to context.json when present; without a loaded configuration, explicit command-line files retain READ_WRITE access.
 
 Both the context filename and every listed filename resolve relative to the application's working directory, not the directory containing the context configuration. READ files must exist and be regular files. Missing READ_WRITE files are valid creation targets. Directories are not file entries. All paths undergo the same containment and no-symlink checks.
 
-Array order is preserved. Duplicate filesystem identities within context are errors, including normalized aliases such as `notes.txt` and `./notes.txt` and existing hard-link aliases. Command-line duplicates are sent only once and never upgrade a context permission. New command-line entries follow in argument order and default to READ_WRITE for compatibility. The first entry's transmitted path remains authoritative.
+Array order is preserved. Duplicate filesystem identities within contexts are errors, including normalized aliases such as `notes.txt` and `./notes.txt` and existing hard-link aliases. Command-line duplicates are sent only once. With a loaded configuration, command-line files require a matching permission rule and never grant or upgrade permissions. New command-line entries follow in argument order. Paths are validated and normalized before permission matching; literal rules also recognize existing hard-link aliases.
 
 ## 3. Output
 
@@ -59,7 +88,7 @@ Required fields are `op`, `encoding`, and `data`. Encoding is `utf-8` or `base64
 
 `{"op":"file_write","path":"notes.txt","encoding":"utf-8","data":"replacement\n"}`
 
-This overwrites an entire file or creates a missing file. `path` must exactly match a READ_WRITE FILE section path. Required fields are `op`, `path`, `encoding`, and `data`. Optional `length` and `sha256` fields verify decoded bytes. Use base64 for binary or non-UTF-8 content.
+This overwrites an entire file or creates a missing file. `path` must have READ_WRITE permission under section 2.1. Required fields are `op`, `path`, `encoding`, and `data`. Optional `length` and `sha256` fields verify decoded bytes. Use base64 for binary or non-UTF-8 content.
 
 ### 3.3 file_patch
 
@@ -91,7 +120,7 @@ Example replacement:
 
 Rules:
 
-- `path` must exactly match a READ_WRITE FILE path and name a regular file existing in the staged file view.
+- `path` must have READ_WRITE permission under section 2.1 and name a regular file existing in the staged file view.
 - `source_sha256` is required and must match that file's bytes when the operation is evaluated.
 - Line numbers are one-based.
 - Line `text` excludes `\n` and `\r` terminators.
@@ -114,11 +143,11 @@ Insertion before line 2 uses old_start:2, old_count:0, new_start:2, new_count:1,
 
 `{"op":"file_delete","path":"notes.txt"}`
 
-This deletes a writable file. Required fields are `op` and `path`; there is no encoded payload. `path` must exactly match a transmitted READ_WRITE FILE path from the context configuration or command-line arguments. READ files, reserved paths, directories, symlinks, and paths outside the working directory cannot be deleted. Deletion is never recursive. Deleting an absent file is allowed and leaves it absent.
+This deletes a writable file. Required fields are `op` and `path`; there is no encoded payload. `path` must have READ_WRITE permission under section 2.1. READ files, reserved paths, directories, symlinks, and paths outside the working directory cannot be deleted. Deletion is never recursive. Deleting an absent file is allowed and leaves it absent.
 
 ### 3.5 file_patch_binary
 
-This additional operation inserts, deletes, or replaces bytes without text decoding or context lines. READ_WRITE permits file_patch_binary under the same exact-path allowlisting, READ protection, containment, and no-symlink rules as file_patch.
+This additional operation inserts, deletes, or replaces bytes without text decoding or context lines. READ_WRITE permits file_patch_binary under the same permission, READ protection, containment, and no-symlink rules as file_patch.
 
 Example shape (replace the hash placeholder with the source file's actual SHA-256):
 
@@ -132,11 +161,41 @@ Offsets are zero-based byte positions in the source at the start of this operati
 
 The target must exist as a regular file in the staged view. Earlier writes or patches supply its source bytes; deletion makes it unavailable until recreated by a write. Later operations observe the binary patch result. Binary patches use the same validation-before-commit, snapshot checks, rollback, and buffered stdout publication as other file operations. This implementation constructs the result in memory and rejects intermediate results exceeding Integer.MAX_VALUE bytes. Use file_patch_binary for precise byte edits to binary or text files; offsets always count bytes, not characters.
 
+### 3.6 list_files
+
+`[{"op":"list_files"}]`
+
+This request must be the sole operation in the response array and accepts no fields other than op. Mixed batches are rejected before any of their operations are applied. The harness recursively enumerates its working directory without following symbolic links. It omits the root, reserved __ciop__ paths, special files, and paths denied by the original permission policy. Unlisted directories are traversed to discover permitted descendants. Without a loaded configuration, discovery is limited to the original explicit file selection and its existing aliases.
+
+The report is JSON with entries, errors, and a complete boolean. Entries are sorted by relative path using forward slashes. Each contains path, type (file or directory), and access (READ or READ_WRITE), including effective history and context write protections. Files also contain size_bytes. Strict UTF-8 text without control characters other than tab, CR, and LF includes line_count: count LF terminators plus one unterminated final line. Empty text has zero lines; CRLF is one terminator; bare CR is content. Binary files omit line_count. Text inspection is streamed.
+
+Entries that disappear or become unsafe are omitted. Inspection failures set complete to false; errors contain a path and generic error only when its permission and containment can be established. Enumeration is not an atomic snapshot, even when complete is true. Files can change during or after inspection.
+
+The harness submits the report to the same provider in a new CIOP envelope. Its STDIN begins: "This is a listing of available files that the application harness has access to, submitted in response to your list_files request." The original context selection is reread and the original permission policy retained. Discovery neither adds files to context nor grants access. Up to five listing follow-ups are allowed per invocation; a sixth request fails.
+
+Immediately before each follow-up provider call, the harness prints a green underlined ANSI status notice to stdout and resets formatting. This notice is separate from model stdout operations and may remain visible if the follow-up fails. Prompt/response file logging continues for every round. When history recording is enabled, persistent conversation history records a list_files_requested event followed by a list_files_report event containing a human-readable UTF-8 listing. Each entry occupies one line with a file: or directory: prefix, a quoted path, and numeric application permission (4=READ, 6=READ_WRITE); files include bytes and text files also include lines. These numbers describe application access, not filesystem permission bits. The listing also preserves completeness and every reported error, including its path and diagnostic. Quoting escapes special characters to keep entries on individual lines. The report is recorded before constructing the follow-up prompt, so reread history context includes it. The follow-up STDIN still contains the structured JSON report. Existing history entries are not rewritten. The ANSI status notice is not saved in history. History marks applied only after the eventual ordinary response batch succeeds.
+
+Use this operation to discover permitted files; requesting additional file contents or changing context selection requires a separate mechanism.
+
+### 3.7 change_contexts
+
+`[{"op":"change_contexts","add":["src/example.java"],"remove":["old.txt"]}]`
+
+This must be the sole operation in its response array. Required fields are op, add, and remove; update is optional and no other fields are accepted. add and update contain whole-file filename strings or subset objects. remove contains literal relative filename strings removing complete selections. Empty arrays are allowed. Duplicate filesystem identities within or across action arrays are rejected. Already-selected additions never replace selections; absent removals and identical updates are reported as no-ops. An update must target an existing configured entry and retains its position and original path spelling. For example, {"op":"change_contexts","add":[],"remove":[],"update":[{"path":"src/example.java","lines":[[10,20]]}]} selects an excerpt; update:["src/example.java"] restores whole-file selection. Every requested addition or update and every prospective follow-up input is validated before committing.
+
+The operation edits only the contexts array in the currently loaded configuration (including a custom --context filename). It is unavailable when configuration is missing, ignored, or supplied programmatically without a source filename. This dedicated operation may update that configuration even though ordinary file operations cannot write it. Permission rules are preserved and never upgraded. Additions must satisfy the existing ordered permissions, containment, reserved-namespace, no-symlink, and regular-file checks. Missing READ_WRITE files remain valid selection targets. Explicit command-line files remain included and cannot be removed by this operation, even if also selected by the configuration.
+
+All changes and follow-up inputs are validated before replacement. Retained entries preserve their spelling and order; new entries are appended in request order after removals. The configuration is rechecked and replaced using a sibling temporary file, preserving POSIX permissions where supported. Concurrent configuration changes detected before replacement reject the operation. This is not a transactional snapshot of the filesystem.
+
+After committing, the harness prints green underlined status text with each addition, removal, or no-op on its own line, followed by a follow-up notice. Filenames are quoted and escaped. It sends the same provider a new envelope containing the updated context selection, retained explicit files, original permissions, and a STDIN report identifying the change_contexts request. Files previously transmitted as READ remain protected for the entire invocation even when removed from context. The configuration itself remains protected from ordinary file operations.
+
+list_files and change_contexts share a maximum of five follow-ups per invocation. Mixed batches and a sixth control request are rejected before applying that request. Successful earlier context changes persist if a later provider call, notice, history write, or ordinary operation fails; do not automatically retry the invocation. Prompt/response logging continues for each round. When enabled, history records a readable contexts_changed event before the follow-up. After a context change, automatic history registration is suspended for the rest of that invocation so it cannot immediately restore a removed history selection. History recording continues; the next invocation resumes normal history registration. Existing history entries are preserved.
+
 ## 4. Ordering and safety
 
 A patch following a write or earlier patch observes the preceding staged result, so its source_sha256 must describe that state. A write followed by deletion leaves the file absent; deletion followed by a write recreates it. A patch after deletion fails unless an intervening write recreates the file. Multiple stdout operations concatenate their bytes.
 
-Implementations enforce READ/READ_WRITE permissions, exact writable-path allowlisting, canonical containment, and no-symlink checks for file_write, file_patch, and file_delete. Aliases must not bypass READ protection. Reserved protocol paths are never writable or deletable. File permissions are enforced by the application, independently of model compliance.
+Implementations enforce the permissions described in section 2.1, canonical containment, and no-symlink checks for every file operation. Transmitted READ files remain protected, including their existing hard-link aliases. Reserved protocol paths are never writable or deletable. File permissions are enforced by the application, independently of model compliance.
 
 ### 4.1 Batch validation and recovery
 
@@ -152,4 +211,4 @@ Input length or hash failures should produce a stdout operation explaining the m
 
 ## 6. Guidance for models
 
-Return only the JSON array. Use stdout for user-facing text. Use file_write for new files, binary files, or whole-file replacement. Use file_patch for a small line-oriented edit to an existing UTF-8 file. Use file_delete to delete an allowed writable file. Copy context and removed lines exactly from the supplied FILE section. Keep hunks simple, ordered, and non-overlapping. Only READ_WRITE files may be changed or deleted, and output paths must exactly match their transmitted paths. The built-in protocol document is always READ-only.
+Return only the JSON array. Use stdout for user-facing text. Use file_write for new files, binary files, or whole-file replacement. Use file_patch for a small line-oriented edit to an existing UTF-8 file. Use file_delete to delete an allowed writable file. Copy context and removed lines exactly from the supplied FILE section. Keep hunks simple, ordered, and non-overlapping. Only files with READ_WRITE permission under section 2.1 may be changed or deleted. The built-in protocol and permissions documents are always READ-only.

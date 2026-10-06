@@ -21,6 +21,8 @@ public final class WorkingDirectoryPaths {
         Path file = resolve(entry.path());
         rejectReserved(directory, file);
         if (Files.notExists(file, NO_FOLLOW)) {
+            if (!entry.selection().isWhole())
+                throw new IllegalArgumentException("Subset file does not exist: " + entry.path());
             if (entry.access() != FileAccess.READ_WRITE)
                 throw new IllegalArgumentException("READ file does not exist: " + entry.path());
         } else if (!Files.isRegularFile(file, NO_FOLLOW)) {

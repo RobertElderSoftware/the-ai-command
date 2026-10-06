@@ -46,17 +46,17 @@ class RequestContextTest {
         run(directory, context, List.of("./read.txt", "write.txt", "binary.dat", "binary.dat"), stdin, provider);
         String prompt = provider.prompt();
         byte[] protocol = ProtocolDocument.bytes();
-        assertTrue(prompt.startsWith("---BEGIN CIOP/1.0---\n" + sectionHeader(
+        assertTrue(prompt.startsWith("---BEGIN CIOP/1.1---\n" + sectionHeader(
                 "utf-8", protocol, FileAccess.READ, ProtocolDocument.PATH)));
         assertTrue(prompt.contains(new String(protocol, StandardCharsets.UTF_8) + "\n---END SECTION---\n"));
-        assertEquals(List.of(ProtocolDocument.PATH, "read.txt", "write.txt", "binary.dat"), prompt.lines()
+        assertEquals(List.of(ProtocolDocument.PATH, RequestContext.PERMISSIONS_PATH, "read.txt", "write.txt", "binary.dat"), prompt.lines()
                 .filter(line -> line.startsWith("---SECTION FILE "))
                 .map(line -> line.substring(line.indexOf(" path=") + 6, line.length() - 3)).toList());
         assertTrue(prompt.contains(sectionHeader("base64", binary, FileAccess.READ_WRITE, "binary.dat")
                 + Base64.getEncoder().encodeToString(binary) + "\n---END SECTION---\n"));
         assertTrue(prompt.endsWith("---SECTION STDIN utf-8 " + stdin.length + " "
                 + AICommandApplication.sha256(stdin) + "---\n" + new String(stdin, StandardCharsets.UTF_8)
-                + "\n---END SECTION---\n---END CIOP/1.0---\n"));
+                + "\n---END SECTION---\n---END CIOP/1.1---\n"));
         assertFalse(prompt.contains("path=config/context.json"));
         assertFalse(prompt.contains("path=./read.txt"));
         assertEquals(1, provider.calls());
@@ -69,7 +69,7 @@ class RequestContextTest {
             application.run(null, null);
         }
         assertEquals(1, provider.prompt().lines().filter(line -> line.startsWith("---SECTION FILE ")).count());
-        assertTrue(provider.prompt().endsWith("---END CIOP/1.0---\n"));
+        assertTrue(provider.prompt().endsWith("---END CIOP/1.1---\n"));
         assertTrue(load(directory, "empty.json", contextJson()).files().isEmpty());
     }
 
@@ -258,4 +258,92 @@ class RequestContextTest {
         return patch ? replaceFirstLine(path, "original\n", "original", "changed")
                 : fileWrite(path, "changed\n");
     }
+    @org.junit.jupiter.api.Test
+    void orderedRulesAuthorizeUnlistedOutputsAndDenyUnmatchedInputs(
+            @org.junit.jupiter.api.io.TempDir Path directory) throws Exception {
+        Files.createDirectory(directory.resolve("src"));
+        Files.writeString(directory.resolve("src/locked.txt"), "protected");
+        Files.writeString(directory.resolve("outside.txt"), "not context");
+        String json = "{\"contexts\":[\"src/locked.txt\"],\"permissions\":["
+                + "{\"src/locked.txt\":\"READ\"},{\"regex:src/.*\":\"READ_WRITE\"}]}";
+        RequestContext context = load(directory, "policy.json", json);
+        CapturingLLMProvider provider = run(directory, context, List.of(),
+                fileWrite("src/new.txt", "created without transmission"));
+        assertEquals("created without transmission", Files.readString(directory.resolve("src/new.txt")));
+        assertFalse(provider.prompt().contains("path=src/new.txt---"));
+        assertTrue(provider.prompt().contains("path=" + RequestContext.PERMISSIONS_PATH + "---"));
+        assertFalse(context.canWrite(directory, "./src/locked.txt"));
+        assertTrue(context.canWrite(directory, "./src/new.txt"));
+        assertFalse(context.canWrite(directory, "outside.txt"));
+        assertThrows(IllegalArgumentException.class, () -> run(directory, context, List.of(),
+                fileWrite("./src/locked.txt", "forbidden")));
+        assertEquals("protected", Files.readString(directory.resolve("src/locked.txt")));
+        CapturingLLMProvider unused = new CapturingLLMProvider("[]");
+        assertThrows(IllegalArgumentException.class, () -> run(directory, context,
+                List.of("outside.txt"), new byte[0], unused));
+        assertEquals(0, unused.calls());
+        assertThrows(IllegalArgumentException.class, () -> run(directory, context, List.of(),
+                fileWrite("outside.txt", "forbidden")));
+        assertEquals("not context", Files.readString(directory.resolve("outside.txt")));
+        run(directory, context, List.of(), object("op", "file_delete", "path", "src/new.txt"));
+        assertFalse(Files.exists(directory.resolve("src/new.txt")));
+        RequestContext reverse = load(directory, "reverse.json",
+                "{\"contexts\":[],\"permissions\":[{\"regex:src/.*\":\"READ_WRITE\"},"
+                        + "{\"src/locked.txt\":\"READ\"}]}");
+        assertTrue(reverse.canWrite(directory, "src/locked.txt"));
+    }
+
+    @org.junit.jupiter.api.Test
+    void configuredEmptyRulesDenyAccessAndLiteralSelectorsAreNotRegex(
+            @org.junit.jupiter.api.io.TempDir Path directory) throws Exception {
+        Files.writeString(directory.resolve("a.txt"), "reference");
+        RequestContext empty = load(directory, "empty.json", "{\"contexts\":[],\"permissions\":[]}");
+        assertFalse(empty.canWrite(directory, "a.txt"));
+        assertThrows(IllegalArgumentException.class, () -> run(directory, empty, List.of("a.txt")));
+        assertThrows(IllegalArgumentException.class, () -> load(directory, "denied.json",
+                "{\"contexts\":[\"a.txt\"],\"permissions\":[]}"));
+        RequestContext literal = load(directory, "literal.json",
+                "{\"permissions\":[{\"./a.txt\":\"READ_WRITE\"}],\"contexts\":[\"a.txt\"]}");
+        assertTrue(literal.canWrite(directory, "a.txt"));
+        assertFalse(literal.canWrite(directory, "aXtxt"));
+        assertFalse(literal.canWrite(directory, "nested/a.txt"));
+    }
+
+    @org.junit.jupiter.api.Test
+    void regexRulesCannotBypassPathValidation(
+            @org.junit.jupiter.api.io.TempDir Path directory) throws Exception {
+        Path outside = Files.createDirectory(directory.resolve("outside"));
+        Path work = Files.createDirectory(directory.resolve("work"));
+        Files.writeString(outside.resolve("secret.txt"), "protected");
+        Files.createSymbolicLink(work.resolve("link"), outside);
+        RequestContext context = load(work, "policy.json",
+                "{\"contexts\":[],\"permissions\":[{\"regex:.*\":\"READ_WRITE\"}]}");
+        for (String path : List.of("../outside/secret.txt", "link/secret.txt",
+                "link/new.txt", outside.resolve("secret.txt").toString(), "__ciop__/new.txt")) {
+            assertThrows(IllegalArgumentException.class, () -> context.canWrite(work, path));
+            assertThrows(IllegalArgumentException.class, () -> run(work, context, List.of(path)));
+        }
+        assertEquals("protected", Files.readString(outside.resolve("secret.txt")));
+        assertFalse(Files.exists(outside.resolve("new.txt")));
+    }
+
+    @org.junit.jupiter.api.Test
+    void rejectsMalformedSeparatedConfiguration(
+            @org.junit.jupiter.api.io.TempDir Path directory) {
+        for (String json : List.of(
+                "{\"contexts\":[]}",
+                "{\"permissions\":[]}",
+                "{\"contexts\":[],\"permissions\":[],\"permissions\":[]}",
+                "{\"contexts\":[],\"permissions\":[],\"extra\":0}",
+                "{\"contexts\":null,\"permissions\":[]}",
+                "{\"contexts\":[{}],\"permissions\":[]}",
+                "{\"contexts\":[],\"permissions\":[{}]}",
+                "{\"contexts\":[],\"permissions\":[{\"regex:[\":\"READ\"}]}",
+                "{\"contexts\":[],\"permissions\":[{\"x\":\"UNKNOWN\"}]}",
+                "{\"contexts\":[],\"permissions\":[{\"x\":null}]}",
+                "{\"contexts\":[],\"permissions\":[{\"x\":\"READ\",\"x\":\"READ_WRITE\"}]}",
+                "{\"contexts\":[],\"permissions\":[{\"../x\":\"READ\"}]}"))
+            assertThrows(Exception.class, () -> load(directory, "bad.json", json), json);
+    }
+
 }
