@@ -40,6 +40,14 @@ public class AICommandApplication implements AutoCloseable {
     private final OutputStream stdout;
     private final Path workingDirectory;
     private final boolean loggingEnabled;
+    private boolean automaticRetry = true;
+    private ProviderRetry retry = new ProviderRetry();
+
+    public void setAutomaticRetry(boolean enabled) { automaticRetry = enabled; }
+
+    void setRetryController(ProviderRetry controller) {
+        retry = Objects.requireNonNull(controller);
+    }
 
     public AICommandApplication(LLMProvider provider, OutputStream stdout) {
         this(provider, stdout, Path.of("."));
@@ -105,18 +113,11 @@ public class AICommandApplication implements AutoCloseable {
                     : RequestContext.load(workingDirectory, history.contextFilename());
             run(input, inputPaths, context, history);
         } catch (IOException | RuntimeException failure) {
-            //I manually commented out this history logging statement because when codex
-            //fails from an API quota failure, it will echo back the entire context that was
-            //passed into it, and if that gets logged into the conversation history file it
-            //will MASSIVELY increase the size of the conversation history file which will
-            //then get sent back on EVERY SINGLE FUTURE REQUEST, and this will completly 
-            //blow through my entire API usage quota very fast.  TODO:  Think of a better
-            //conversation history logging item for this case.
-            //try {
-            //    history.failed(failure);
-            //} catch (IOException | RuntimeException recordingFailure) {
-            //    failure.addSuppressed(recordingFailure);
-            //}
+            try {
+                history.failed(failure);
+            } catch (IOException | RuntimeException recordingFailure) {
+                failure.addSuppressed(recordingFailure);
+            }
             throw failure;
         }
     }
@@ -187,7 +188,8 @@ public class AICommandApplication implements AutoCloseable {
                     if (stdout instanceof java.io.PrintStream stream && stream.checkError())
                         throw new IOException("Could not publish the follow-up notice");
                 }
-                String response = provider.complete(prompt);
+                String response = retry.complete(provider, prompt, stdout, history,
+                        contextCommitted, automaticRetry);
                 log("response.txt", response);
                 if (history != null) history.received();
                 List<Operation> operations = parseOperations(response);
@@ -229,8 +231,7 @@ public class AICommandApplication implements AutoCloseable {
             }
         } catch (IOException | RuntimeException failure) {
             if (contextCommitted)
-                throw new IOException("Context changes were committed; a subsequent follow-up failed. "
-                        + "Do not retry the request automatically.", failure);
+                throw new ContextCommittedException(failure);
             throw failure;
         }
     }

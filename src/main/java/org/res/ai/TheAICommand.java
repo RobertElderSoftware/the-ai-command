@@ -21,13 +21,14 @@ public final class TheAICommand {
     private static Map<String, String> descriptions() {
         Map<String, String> descriptions = new LinkedHashMap<>();
         descriptions.put("--help", "Print this help and exit without reading stdin or contacting an LLM.");
+        descriptions.put("--no-auto-retry", "Disable both network recovery waiting and provider-limit waiting.");
         descriptions.put("--enable-conversation-history", "Enable history recording, creating the conversation_history directory if missing.");
         descriptions.put("--disable-conversation-history", "Disable conversation history recording and registration.");
         descriptions.put("--ignore-context", "Ignore the default or explicitly selected context file, including history registration.");
         descriptions.put("--backend", "Choose codex, openai, or loopback.");
         descriptions.put("--model", "Choose the model used by the openai backend.");
         descriptions.put("--context", "Load ordered files and READ/READ_WRITE permissions from a JSON file.");
-        descriptions.put("--enable-context", "Alias for --context; defaults to context.json when no filename is supplied.");
+        descriptions.put("--enable-context", "Select a context file and create it if missing; defaults to context.json. New configurations have empty contexts and permissions.");
         return descriptions;
     }
 
@@ -55,6 +56,8 @@ public final class TheAICommand {
             };
             try (AICommandApplication application =
                          new AICommandApplication(provider, System.out, directory)) {
+                application.setAutomaticRetry(!options.containsKey("--no-auto-retry"));
+                ContextInitialization.prepare(directory, options);
                 application.runWithHistory(stdin, files, options.get("--context"),
                         options.containsKey("--disable-conversation-history"),
                         options.containsKey("--ignore-context"),
@@ -62,15 +65,37 @@ public final class TheAICommand {
             }
             return 0;
         } catch (IOException | RuntimeException exception) {
-            System.err.println("The AI command failed:");
-            exception.printStackTrace(System.err);
-            return 1;
+            return FailureReporting.report(exception, System.out, System.err);
         }
     }
 
     private static void printHelp() {
         System.out.println("Usage: java -jar the-ai-command.jar [options] [--] [files...]");
         System.out.println("Read a prompt from stdin, include the supplied files, and apply the LLM response.");
+        System.out.println("Exit codes: 0 success; 1 general failure; 3 provider limit; 4 network failure or uncertain submission.");
+        System.out.println("Provider calls automatically retry after a known future reset plus a five-second buffer.");
+        System.out.println("Ctrl+C exits while waiting. Coloured ANSI countdowns refresh every second, including with piped stdin. Use -Dai.retry.ansi=false for plain transition notices when redirecting output.");
+        System.out.println("Only the exact failed provider prompt is resent; committed context operations are not repeated.");
+        System.out.println("Unknown, incomplete, stale, or time-only reset information exits with code 3; billing quotas are not retried.");
+        System.out.println("Codex reset lookup uses a three-second App Server query by default; -Dai.codex.rateLimitLookup=false disables it.");
+        System.out.println("Use -Dai.codex.limitId=codex to select the metered bucket. OpenAI SDK retries are disabled; this application owns retry scheduling.");
+        System.out.println("Network preflight requires curl on PATH. Credential-free HEAD checks have a 10-second total budget, including DNS.");
+        System.out.println("Use -Dai.network.probeSeconds=10 and -Dai.network.retrySeconds=15 to configure checks and waits (1..3600).");
+        System.out.println("Model generation has no new deadline; OpenAI connect timeout is 10 seconds and read/write/request timeouts are disabled.");
+        System.out.println("Codex preflight reads effective App Server configuration/account kind. If unavailable, set -Dai.codex.networkEndpoint=https://provider/path.");
+        System.out.println("Codex probes inherit HTTP(S)_PROXY/ALL_PROXY/NO_PROXY; OpenAI probes use the same Java proxy route pinned to its SDK.");
+        System.out.println("Probe TLS trust uses curl configuration; configure it consistently with your provider. Certificate/configuration failures are not retried.");
+        System.out.println("Transport recovery permits at most 3 fresh resubmissions per prompt; delays are 30, 60, 120 seconds plus 0..10% jitter.");
+        System.out.println("Configure -Dai.network.maxResubmissions=3 (0..10), -Dai.network.backoffSeconds=30 (1..3600); delay caps at one hour before jitter.");
+        System.out.println("Use -Dai.network.replayUncertain=false to prohibit uncertain fresh submissions; original-result retrieval remains allowed.");
+        System.out.println("OpenAI: -Dai.openai.background=true enables background polling and retrieval by response ID; requires backend/model support and server retention.");
+        System.out.println("Without a received response ID, OpenAI falls back to bounded resubmission. Codex session resume is not original-result retrieval.");
+        System.out.println("Recovery lookups are attempted at most 3 times per interrupted submission; failed lookups do not prove the original was rejected.");
+        System.out.println("A background job may continue on the server after Ctrl+C. Retries can consume duplicate quota; exactly-once execution is not guaranteed.");
+        System.out.println("Network status shows outage detection time, elapsed wait, check retries, resubmissions and recovery lookups. Dates use local time as dd MMM HH:mm:ss; history omits countdown ticks.");
+        System.out.println("Ctrl+C attempts a bounded outage summary; forced termination can leave an incomplete episode.");
+        System.out.println("Custom Codex subprocess constructors do not infer a network endpoint or add preflight checks.");
+        System.out.println("Retries retain the local history request ID, not a provider deduplication key; history omits countdown ticks. Use --no-auto-retry to disable waiting.");
         System.out.println();
         DESCRIPTIONS.forEach((name, description) -> {
             String defaultValue = DEFAULTS.get(name);
@@ -114,7 +139,7 @@ public final class TheAICommand {
         System.out.println("Use --enable-conversation-history to create the history directory; --disable-conversation-history disables recording.");
         System.out.println("The enable and disable conversation-history flags cannot be combined.");
         System.out.println("History files are registered as READ in the selected context file before it is loaded.");
-        System.out.println("A missing context file is not created; the request uses an empty context.");
+        System.out.println("Only --enable-context creates a missing configuration; --ignore-context suppresses creation. Add permission rules before including project files.");
         System.out.println("The history directory and its context configuration cannot be overwritten by response operations.");
     }
 
@@ -138,6 +163,7 @@ public final class TheAICommand {
                 if (value.isBlank())
                     throw new IllegalArgumentException(name + " requires a nonblank filename when supplied");
                 values.put("--context", value);
+                values.put("--enable-context", "true");
             } else if (!VALUE_OPTIONS.contains(name)) {
                 if (equals >= 0) throw new IllegalArgumentException(name + " does not accept a value");
                 values.put(name, "true");

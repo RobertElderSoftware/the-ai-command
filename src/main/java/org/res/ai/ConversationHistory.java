@@ -94,8 +94,16 @@ public final class ConversationHistory {
     public void applied() throws IOException { append("applied", null); }
 
     public void failed(Throwable failure) throws IOException {
-        append("failed", (failure.getClass().getName() + ": " + failure.getMessage())
-                .getBytes(StandardCharsets.UTF_8));
+        ProviderLimitException limit = FailureReporting.limit(failure);
+        if (limit != null) {
+            append("provider_limit", limit.history(failure instanceof ContextCommittedException)
+                    .toString().getBytes(StandardCharsets.UTF_8));
+        } else {
+            // Exception messages may contain an entire prompt. Never copy them to history.
+            append("failed", (ProviderLimitException.safe(failure.getClass().getName(), 160)
+                    + "; see terminal diagnostics; completion is not established")
+                    .getBytes(StandardCharsets.UTF_8));
+        }
     }
 
     private void append(String event, byte[] payload) throws IOException {
@@ -175,6 +183,21 @@ public final class ConversationHistory {
     /** Store a readable listing before constructing the JSON follow-up prompt. */
     public void listingReport(String report) throws IOException {
         if (enabled) append("list_files_report", ListingHistoryFormat.format(report).getBytes(StandardCharsets.UTF_8));
+    }
+
+    void retryEvent(String event, ProviderLimitException limit, boolean contextCommitted,
+            long attempt, java.time.Instant retryAt, boolean authorized) throws IOException {
+        JsonObject data = limit.history(contextCommitted);
+        data.addProperty("automaticReplayAuthorized", authorized);
+        data.addProperty("replayScope", "provider_call");
+        data.addProperty("retryAttempt", attempt);
+        data.addProperty("scheduledRetryAt", retryAt.toString());
+        data.addProperty("bufferSeconds", 5);
+        append(event, data.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    void networkEvent(String event, JsonObject data) throws IOException {
+        append(event, data.toString().getBytes(StandardCharsets.UTF_8));
     }
 
     public void listingRequested() throws IOException { append("list_files_requested", null); }

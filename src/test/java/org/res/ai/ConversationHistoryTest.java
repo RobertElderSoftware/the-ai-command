@@ -301,11 +301,14 @@ class ConversationHistoryTest {
                 assertThrows(RuntimeException.class,
                         () -> application.runWithHistory(new byte[0], List.of(), null));
             }
-            //TODO:  Commented out while addressing conversation history size blowup issue.
-            //assertEquals(providerFails ? List.of("user", "request_sent", "failed") : List.of("user", "request_sent", "response_received", "failed"), events(work));
-            //if (!providerFails) assertFalse(records(work).get(2).has("data"));
-            //assertTrue(records(work).get(records(work).size() - 1).get("data").getAsString()
-            //        .contains(providerFails ? "upstream unavailable" : "not valid JSON"));
+            assertEquals(providerFails ? List.of("user", "request_sent", "failed")
+                    : List.of("user", "request_sent", "response_received", "failed"), events(work));
+            if (!providerFails) assertFalse(records(work).get(2).has("data"));
+            String summary = records(work).get(records(work).size() - 1).get("data").getAsString();
+            assertTrue(summary.length() < 300);
+            assertTrue(summary.contains("completion is not established"));
+            assertFalse(summary.contains("upstream unavailable"));
+            assertFalse(summary.contains(raw));
         }
     }
 
@@ -320,10 +323,12 @@ class ConversationHistoryTest {
             assertTrue(failure.getMessage().contains("Files committed"));
         }
         assertEquals("committed", Files.readString(directory.resolve("result.txt")));
-        //TODO:  Commented out while addressing conversation history size blowup issue.
-        //assertEquals(List.of("user", "request_sent", "response_received", "failed"), events(directory));
-        //assertFalse(records(directory).get(2).has("data"));
-        //assertTrue(records(directory).get(3).get("data").getAsString().contains("Do not retry"));
+        assertEquals(List.of("user", "request_sent", "response_received", "failed"), events(directory));
+        assertFalse(records(directory).get(2).has("data"));
+        String summary = records(directory).get(3).get("data").getAsString();
+        assertTrue(summary.contains("completion is not established"));
+        assertFalse(summary.contains("broken output"));
+        assertTrue(summary.length() < 300);
     }
 
     void binaryPayloadsAndMidnightEventsRoundTripAndRegisterBothDatesOnce() throws Exception {
@@ -409,9 +414,12 @@ class ConversationHistoryTest {
         }
         assertEquals(0, provider.calls());
         assertEquals(invalid, Files.readString(directory.resolve("context.json")));
-        //TODO:  Commented out while addressing conversation history size blowup issue.
-        //assertEquals(List.of("user", "failed"), events(directory));
-        //assertEquals("saved", records(directory).get(0).get("data").getAsString());
+        assertEquals(List.of("user", "failed"), events(directory));
+        assertEquals("saved", records(directory).get(0).get("data").getAsString());
+        String summary = records(directory).get(1).get("data").getAsString();
+        assertTrue(summary.contains("completion is not established"));
+        assertFalse(summary.contains(invalid));
+        assertTrue(summary.length() < 300);
     }
 
     void historyAndContextPathsRejectSymlinksTraversalAndReservedNames() throws Exception {

@@ -20,6 +20,9 @@ public final class OpenAILLMProvider implements LLMProvider {
     private final ExecutorService streamExecutor;
     private final String model;
     private OpenAIClient client;
+    private java.net.URI endpoint;
+    private java.net.Proxy proxy;
+    private String responseId;
 
     public OpenAILLMProvider(String model) {
         if (model == null || model.isBlank()) {
@@ -37,21 +40,89 @@ public final class OpenAILLMProvider implements LLMProvider {
         if (apiKey == null || apiKey.isBlank()) {
             throw new IllegalStateException("OPENAI_API_KEY is not set");
         }
+        String base = System.getenv("OPENAI_BASE_URL");
+        endpoint = NetworkProbe.endpoint(base == null ? "https://api.openai.com/v1" : base);
+        proxy = NetworkProbe.javaProxy(endpoint);
         client = OpenAIOkHttpClient.builder()
                 .fromEnv()
+                .baseUrl(endpoint.toString())
+                .proxy(proxy)
+                .maxRetries(0)
+                .timeout(com.openai.core.Timeout.builder()
+                        .connect(java.time.Duration.ofSeconds(10))
+                        .read(java.time.Duration.ZERO).write(java.time.Duration.ZERO)
+                        .request(java.time.Duration.ZERO).build())
                 .dispatcherExecutorService(httpExecutor)
                 .streamHandlerExecutor(streamExecutor)
                 .build();
     }
 
     @Override
+    public void checkNetwork() throws java.io.IOException {
+        initialize();
+        NetworkProbe.check("openai", endpoint, proxy);
+    }
+
+    @Override
     public String complete(String prompt) {
         if (prompt == null) throw new IllegalArgumentException("prompt must not be null");
         initialize();
-        Response response = client.responses().create(ResponseCreateParams.builder()
-                .model(model)
-                .input(prompt)
-                .build());
+        responseId = null;
+        final Response response;
+        boolean background = Boolean.getBoolean("ai.openai.background");
+        try {
+            var params = ResponseCreateParams.builder().model(model).input(prompt);
+            if (background) params.background(true);
+            response = client.responses().create(params.build());
+        } catch (com.openai.errors.OpenAIIoException failure) {
+            if (!ProviderNetworkException.transport(failure)) throw failure;
+            // The SDK does not prove that no bytes were accepted, even for connect errors
+            // after internal route selection. Never guess that a replay is safe.
+            throw new ProviderNetworkException("openai", NetworkProbe.display(endpoint),
+                    ProviderNetworkException.Phase.UNCERTAIN);
+        } catch (com.openai.errors.OpenAIServiceException failure) {
+            throw OpenAILimits.normalize(failure);
+        }
+        if (background) responseId = response.id();
+        return awaitResponse(response, background);
+    }
+
+    @Override public boolean canRecover() { return responseId != null; }
+
+    @Override public String recover() {
+        if (responseId == null) throw new IllegalStateException("No response ID available");
+        return awaitResponse(retrieve(), true);
+    }
+
+    private Response retrieve() {
+        try {
+            return client.responses().retrieve(responseId);
+        } catch (com.openai.errors.OpenAIIoException failure) {
+            if (!ProviderNetworkException.transport(failure)) throw failure;
+            throw new ProviderNetworkException("openai", NetworkProbe.display(endpoint),
+                    ProviderNetworkException.Phase.UNCERTAIN);
+        } catch (com.openai.errors.OpenAIServiceException failure) {
+            // A lookup limit is not a rejected prompt: never hand it to the submission limit loop.
+            throw new IllegalStateException("Original response lookup failed; no fresh prompt was submitted", failure);
+        }
+    }
+
+    private String awaitResponse(Response response, boolean background) {
+        if (background) {
+            while (response.status().filter(status ->
+                    status.equals(com.openai.models.responses.ResponseStatus.QUEUED)
+                    || status.equals(com.openai.models.responses.ResponseStatus.IN_PROGRESS)).isPresent()) {
+                try { Thread.sleep(1000); }
+                catch (InterruptedException cancelled) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Response polling cancelled", cancelled);
+                }
+                response = retrieve();
+            }
+            if (!response.status().filter(com.openai.models.responses.ResponseStatus.COMPLETED::equals).isPresent())
+                throw new IllegalStateException("Original background response did not complete; no replay");
+        }
+        responseId = null;
         return response.output().stream()
                 .flatMap(item -> item.message().stream())
                 .flatMap(message -> message.content().stream())
