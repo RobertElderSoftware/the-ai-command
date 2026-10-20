@@ -289,8 +289,8 @@ final class NetworkRetry {
         if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException("Network retry cancelled");
     }
 
-    private static void write(OutputStream output, String text) throws IOException {
-        output.write(text.getBytes(StandardCharsets.UTF_8));
+    private void write(OutputStream output, String text) throws IOException {
+        output.write(StatusColour.format(text.replace("\u001b[0m", ""), terminal).getBytes(StandardCharsets.UTF_8));
         output.flush();
         if (output instanceof PrintStream stream && stream.checkError())
             throw new IOException("Could not publish network retry status");

@@ -49,7 +49,7 @@ class RequestContextTest {
         assertTrue(prompt.startsWith("---BEGIN CIOP/1.1---\n" + sectionHeader(
                 "utf-8", protocol, FileAccess.READ, ProtocolDocument.PATH)));
         assertTrue(prompt.contains(new String(protocol, StandardCharsets.UTF_8) + "\n---END SECTION---\n"));
-        assertEquals(List.of(ProtocolDocument.PATH, RequestContext.PERMISSIONS_PATH, "read.txt", "write.txt", "binary.dat"), prompt.lines()
+        assertEquals(List.of(ProtocolDocument.PATH, RequestContext.PERMISSIONS_PATH, WorkflowSession.DOCUMENT_PATH, "read.txt", "write.txt", "binary.dat"), prompt.lines()
                 .filter(line -> line.startsWith("---SECTION FILE "))
                 .map(line -> line.substring(line.indexOf(" path=") + 6, line.length() - 3)).toList());
         assertTrue(prompt.contains(sectionHeader("base64", binary, FileAccess.READ_WRITE, "binary.dat")

@@ -8,17 +8,14 @@ public enum OperationType {
     FILE_PATCH_BINARY("file_patch_binary"),
     FILE_DELETE("file_delete"),
     LIST_FILES("list_files"),
-    CHANGE_CONTEXTS("change_contexts");
+    CHANGE_CONTEXTS("change_contexts"),
+    WORKFLOW_UPDATE("workflow_update");
 
     private final String opcode;
 
-    OperationType(String opcode) {
-        this.opcode = opcode;
-    }
+    OperationType(String opcode) { this.opcode = opcode; }
 
-    public String opcode() {
-        return opcode;
-    }
+    public String opcode() { return opcode; }
 
     public static OperationType fromOpcode(String opcode) {
         for (OperationType type : values()) {

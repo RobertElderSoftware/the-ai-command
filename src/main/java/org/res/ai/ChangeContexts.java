@@ -4,7 +4,6 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import com.google.gson.JsonPrimitive;
 import com.google.gson.Strictness;
 import com.google.gson.stream.JsonReader;
@@ -22,24 +21,73 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 
-/** Validates and commits selection changes without granting file permissions. */
+/** Plans selection changes independently of persistence and input contents. */
 final class ChangeContexts {
     record Result(RequestContext context, List<ContextFile> files, String report) { }
     private record Changes(List<ContextFile> add, List<String> remove, List<ContextFile> update) { }
 
+    record Plan(List<ContextFile> selections, List<ContextFile> validationInputs, String report) {
+        JsonArray entries() {
+            JsonArray result = new JsonArray();
+            selections.forEach(file -> result.add(file.contextEntry()));
+            return result;
+        }
+
+        boolean changed(RequestContext original) {
+            JsonArray previous = new JsonArray();
+            original.files().forEach(file -> previous.add(file.contextEntry()));
+            return !entries().equals(previous);
+        }
+
+        String historyReport() {
+            return report.lines().map(line -> "# context: " + line + "\n")
+                    .collect(java.util.stream.Collectors.joining());
+        }
+
+        String notice() {
+            List<String> details = historyReport().lines().toList();
+            String result = details.stream().limit(8)
+                    .map(line -> line.length() > 240 ? line.substring(0, 240) + "..." : line)
+                    .collect(java.util.stream.Collectors.joining("\n"));
+            return details.size() <= 8 ? result
+                    : result + "\n# context: (+" + (details.size() - 8) + " more lines)";
+        }
+    }
+
     private ChangeContexts() { }
+
+    private static JsonObject parseRequest(String data) {
+        try {
+            return StrictJson.parse(data).getAsJsonObject();
+        } catch (com.google.gson.JsonParseException | IllegalStateException failure) {
+            throw new IllegalArgumentException("Invalid change_contexts JSON: "
+                    + failure.getMessage(), failure);
+        }
+    }
+
+    static boolean followUp(JsonObject object) {
+        if (!object.has("follow_up")) return true;
+        JsonElement value = object.get("follow_up");
+        if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isBoolean())
+            throw new IllegalArgumentException("change_contexts follow_up must be a boolean");
+        return value.getAsBoolean();
+    }
+
+    static boolean followUp(Operation operation) {
+        return followUp(parseRequest(operation.data));
+    }
 
     static Operation operation(JsonObject object) {
         changes(object);
-        return new Operation(OperationType.CHANGE_CONTEXTS, null, "utf-8",
-                object.toString(), null, null);
+        return new Operation(OperationType.CHANGE_CONTEXTS, null, "utf-8", object.toString(), null, null);
     }
 
     private static Changes changes(JsonObject object) {
         if (!object.keySet().containsAll(Set.of("op", "add", "remove"))
-                || !Set.of("op", "add", "remove", "update").containsAll(object.keySet())
+                || !Set.of("op", "add", "remove", "update", "follow_up").containsAll(object.keySet())
                 || !new JsonPrimitive("change_contexts").equals(object.get("op")))
-            throw new IllegalArgumentException("change_contexts requires op, add, remove, and optional update");
+            throw new IllegalArgumentException("change_contexts requires op, add, remove, and optional update and follow_up");
+        followUp(object);
         return new Changes(entries(object, "add"), names(object, "remove"),
                 object.has("update") ? entries(object, "update") : List.of());
     }
@@ -67,55 +115,46 @@ final class ChangeContexts {
     private static List<String> names(JsonObject object, String field) {
         List<String> result = new ArrayList<>();
         for (JsonElement name : array(object, field)) {
-            if (!name.isJsonPrimitive() || !name.getAsJsonPrimitive().isString()
-                    || name.getAsString().isBlank())
+            if (!name.isJsonPrimitive() || !name.getAsJsonPrimitive().isString() || name.getAsString().isBlank())
                 throw new IllegalArgumentException("change_contexts filenames must be nonblank strings");
             result.add(name.getAsString());
         }
         return result;
     }
 
-    static Result apply(Path directory, RequestContext original, List<String> arguments,
-            String data) throws IOException {
-        if (!original.hasPermissions() || original.sourceFilename() == null)
-            throw new IllegalArgumentException("change_contexts requires a loaded context configuration; "
-                    + "it is unavailable with --ignore-context or a missing configuration");
+    /** No filesystem mutation or content validation: callers supply the appropriate file view. */
+    static Plan plan(Path directory, RequestContext current, List<String> arguments, String data) throws IOException {
+        if (!current.hasPermissions() || current.sourceFilename() == null)
+            throw new IllegalArgumentException("change_contexts requires a loaded context configuration");
         WorkingDirectoryPaths paths = new WorkingDirectoryPaths(directory);
-        Path target = paths.contextFile(new ContextFile(original.sourceFilename(), FileAccess.READ));
-        byte[] snapshot = WorkingDirectoryPaths.read(target);
-        Object identity = identity(target);
-        RequestContext current = RequestContext.load(directory, original.sourceFilename());
-        if (!current.permissionsDocument().equals(original.permissionsDocument()))
-            throw new IllegalArgumentException("Context permissions changed during the request");
-        final JsonElement parsed;
-        try {
-            parsed = StrictJson.parse(data);
-        } catch (com.google.gson.JsonParseException exception) {
-            throw new IllegalArgumentException("Invalid change_contexts JSON", exception);
-        }
-        if (!parsed.isJsonObject())
-            throw new IllegalArgumentException("change_contexts must be an object");
-        Changes request = changes(parsed.getAsJsonObject());
+        JsonObject operation = parseRequest(data);
+        Changes request = changes(operation);
+        boolean followUp = followUp(operation);
         List<String> allNames = new ArrayList<>(request.remove());
         request.add().forEach(file -> allNames.add(file.path()));
         request.update().forEach(file -> allNames.add(file.path()));
         validateNames(paths, allNames);
         List<String> explicit = arguments == null ? List.of() : arguments;
-        for (String name : request.remove())
-            if (indexOf(paths, explicit, name) >= 0)
+        for (String name : request.remove()) {
+            if (followUp && indexOf(paths, explicit, name) >= 0)
                 throw new IllegalArgumentException("Cannot remove an explicitly supplied command-line file: " + name);
+            if (!followUp) protectHistory(paths, current.files(), name);
+        }
+        if (!followUp)
+            for (ContextFile file : request.update()) protectHistory(paths, current.files(), file.path());
 
         List<ContextFile> selected = new ArrayList<>(current.files());
+        List<ContextFile> inputs = new ArrayList<>();
         StringBuilder report = new StringBuilder("Context configuration: ")
-                .append(quote(original.sourceFilename())).append('\n');
+                .append(quote(current.sourceFilename())).append('\n');
         for (String name : request.remove()) {
             int index = selectionIndex(paths, selected, name);
             report.append(index < 0 ? "Not in context: " : "Removed from context: ")
                     .append(quote(index < 0 ? name : selected.remove(index).path())).append('\n');
         }
         for (ContextFile addition : request.add()) {
-            // Even an idempotent addition must be permitted and contain valid ranges.
-            ContextFile checked = checked(directory, paths, current, addition);
+            ContextFile checked = permitted(directory, current, addition);
+            inputs.add(checked); // Validate even a no-op addition's requested excerpt.
             int index = selectionIndex(paths, selected, addition.path());
             if (index < 0) selected.add(checked);
             report.append(index < 0 ? "Added to context: " : "Already in context: ")
@@ -125,50 +164,73 @@ final class ChangeContexts {
             int index = selectionIndex(paths, selected, update.path());
             if (index < 0)
                 throw new IllegalArgumentException("Cannot update a file absent from configured contexts: " + update.path());
-            checked(directory, paths, current, update);
+            ContextFile checked = permitted(directory, current, update);
+            inputs.add(checked);
             ContextFile previous = selected.get(index);
-            ContextFile replacement = new ContextFile(previous.path(), previous.access(), update.selection());
-            boolean same = previous.selection().equals(update.selection());
+            ContextFile replacement = new ContextFile(previous.path(), checked.access(), update.selection());
             selected.set(index, replacement);
-            report.append(same ? "Unchanged context selection: " : "Updated context selection: ")
+            report.append(previous.selection().equals(update.selection())
+                    ? "Unchanged context selection: " : "Updated context selection: ")
                     .append(describe(replacement)).append('\n');
         }
         if (allNames.isEmpty()) report.append("No context changes requested.\n");
-        RequestContext updated = current.selectEntries(directory, selected);
-        List<ContextFile> files = updated.merge(paths, explicit);
-        // Validate retained entries and explicit files as well as requested changes.
-        for (ContextFile file : files) validateInput(paths, file);
-        JsonObject document = JsonParser.parseString(new String(snapshot, StandardCharsets.UTF_8)).getAsJsonObject();
-        JsonArray contexts = new JsonArray();
-        updated.files().forEach(file -> contexts.add(file.contextEntry()));
-        boolean changed = !contexts.equals(document.get("contexts"));
-        document.add("contexts", contexts);
-        byte[] replacement = (new GsonBuilder().setPrettyPrinting().disableHtmlEscaping()
-                .create().toJson(document) + "\n").getBytes(StandardCharsets.UTF_8);
-        AtomicFileReplacement.Validation validation = () -> {
-            paths.contextFile(new ContextFile(original.sourceFilename(), FileAccess.READ));
-            if (!Objects.equals(identity, identity(target))
-                    || !Arrays.equals(snapshot, WorkingDirectoryPaths.read(target)))
-                throw new IOException("Context configuration changed before commit");
-        };
-        validation.validate();
-        if (changed) AtomicFileReplacement.replace(target, replacement, ".ciop-context-", true, validation);
-        return new Result(updated, files, report.toString());
+        validateNames(paths, selected.stream().map(ContextFile::path).toList());
+        for (ContextFile file : selected) inputs.add(permitted(directory, current, file));
+        return new Plan(List.copyOf(selected), List.copyOf(inputs), report.toString());
     }
 
-    private static ContextFile checked(Path directory, WorkingDirectoryPaths paths,
-            RequestContext context, ContextFile file) throws IOException {
+    private static void protectHistory(WorkingDirectoryPaths paths, List<ContextFile> selected, String name)
+            throws IOException {
+        Path target = paths.resolve(name);
+        Path history = paths.resolve(ConversationHistory.DIRECTORY);
+        if (target.startsWith(history))
+            throw new IllegalArgumentException("Trailing context changes must preserve conversation history: " + name);
+        for (ContextFile file : selected) {
+            Path source = paths.resolve(file.path());
+            if (source.startsWith(history) && WorkingDirectoryPaths.sameFile(source, target))
+                throw new IllegalArgumentException("Trailing context changes must preserve conversation history: " + name);
+        }
+    }
+
+    private static ContextFile permitted(Path directory, RequestContext context, ContextFile file) throws IOException {
         FileAccess access = context.accessFor(directory, file.path());
         if (access == null) throw new IllegalArgumentException("Read permission denied: " + file.path());
-        ContextFile checked = file.withAccess(access);
-        validateInput(paths, checked);
-        return checked;
+        return file.withAccess(access);
     }
 
-    private static void validateInput(WorkingDirectoryPaths paths, ContextFile file) throws IOException {
+    static Result apply(Path directory, RequestContext original, List<String> arguments, String data) throws IOException {
+        if (!original.hasPermissions() || original.sourceFilename() == null)
+            throw new IllegalArgumentException("change_contexts requires a loaded context configuration");
+        if (!followUp(parseRequest(data)))
+            throw new IllegalArgumentException("Non-follow-up context changes require batch staging");
+        WorkingDirectoryPaths paths = new WorkingDirectoryPaths(directory);
+        ConfigurationStore store = original.store;
+        if (store == null) throw new IllegalArgumentException("Missing configuration store");
+        store.verify();
+        RequestContext current = store.context();
+        Plan plan = plan(directory, current, arguments, data);
+        for (ContextFile file : plan.validationInputs()) validateInput(paths, file);
+        RequestContext updated = current.selectEntries(directory, plan.selections());
+        List<ContextFile> files = updated.merge(paths, arguments == null ? List.of() : arguments);
+        WorkflowSession.validateSelection(directory, updated, files);
+        for (ContextFile file : files) validateInput(paths, file);
+        store.commit(store.replacement(null, plan.selections()));
+        return new Result(updated, files, plan.report());
+    }
+
+    static void validateInput(WorkingDirectoryPaths paths, ContextFile file) throws IOException {
         Path input = paths.contextFile(file);
         if (!file.selection().isWhole()) SubsetEnvelope.read(paths, file).section(file);
         else if (Files.exists(input, LinkOption.NOFOLLOW_LINKS)) WorkingDirectoryPaths.read(input);
+    }
+
+    static void validateBytes(ContextFile file, byte[] bytes) throws IOException {
+        if (bytes == null) {
+            if (file.access() != FileAccess.READ_WRITE || !file.selection().isWhole())
+                throw new IllegalArgumentException("Selected file does not exist in staged result: " + file.path());
+        } else if (!file.selection().isWhole()) {
+            SubsetEnvelope.read(file, bytes).section(file);
+        }
     }
 
     private static String describe(ContextFile file) {
@@ -200,8 +262,7 @@ final class ChangeContexts {
         }
     }
 
-    private static int selectionIndex(WorkingDirectoryPaths paths, List<ContextFile> files,
-            String name) throws IOException {
+    private static int selectionIndex(WorkingDirectoryPaths paths, List<ContextFile> files, String name) throws IOException {
         return indexOf(paths, files.stream().map(ContextFile::path).toList(), name);
     }
 

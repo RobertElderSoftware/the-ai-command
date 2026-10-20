@@ -38,6 +38,9 @@ public interface LLMProvider extends AutoCloseable {
         throw new UnsupportedOperationException("Original response retrieval is unavailable");
     }
 
+    /** Install a request-scoped observer; unsupported providers leave it unused. */
+    default void setActivityListener(ProviderActivity.Listener listener) { }
+
     /** Close resources. */
     @Override
     void close();

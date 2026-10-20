@@ -42,6 +42,18 @@ public class AICommandApplication implements AutoCloseable {
     private final boolean loggingEnabled;
     private boolean automaticRetry = true;
     private ProviderRetry retry = new ProviderRetry();
+    private WorkflowSession workflow;
+    private PreparedPrompt preparedPrompt;
+    private byte[] originalInput;
+
+    /** Captured sections and input are retained separately; retries never parse wire text. */
+    private record PreparedPrompt(String sections, byte[] input) {
+        String render(String path, String diagnostic) {
+            return sections + (path == null ? "" : section("FILE",
+                    diagnostic.getBytes(StandardCharsets.UTF_8), "access=READ path=" + path))
+                    + section("STDIN", input, null) + END + "\n";
+        }
+    }
 
     public void setAutomaticRetry(boolean enabled) { automaticRetry = enabled; }
 
@@ -110,7 +122,7 @@ public class AICommandApplication implements AutoCloseable {
             history.input(input);
             RequestContext context = ignoreContext || Files.notExists(resolve(history.contextFilename()), NO_FOLLOW)
                     ? RequestContext.empty()
-                    : RequestContext.load(workingDirectory, history.contextFilename());
+                    : history.configuration();
             run(input, inputPaths, context, history);
         } catch (IOException | RuntimeException failure) {
             try {
@@ -124,6 +136,8 @@ public class AICommandApplication implements AutoCloseable {
 
     private void run(byte[] stdin, List<String> inputPaths, RequestContext context,
             ConversationHistory history) throws IOException {
+        originalInput = stdin == null ? new byte[0] : stdin.clone();
+        if (history != null) history.useConfiguration(context.store);
         List<ContextFile> files = new ArrayList<>(Objects.requireNonNull(context, "context")
                 .merge(new WorkingDirectoryPaths(workingDirectory), inputPaths));
         Set<String> writable = new HashSet<>();
@@ -146,6 +160,9 @@ public class AICommandApplication implements AutoCloseable {
     }
 
     public void executePrompt(String prompt, Set<String> allowedFilePaths) throws IOException {
+        workflow = null;
+        preparedPrompt = null;
+        originalInput = null;
         Set<String> allowed = allowedFilePaths == null ? Set.of() : Set.copyOf(allowedFilePaths);
         executePrompt(prompt, allowed::contains, Set.of(), null, allowed.stream().sorted()
                 .map(path -> new ContextFile(path, FileAccess.READ_WRITE)).toList(), RequestContext.empty(), List.of());
@@ -157,10 +174,8 @@ public class AICommandApplication implements AutoCloseable {
         String value = Objects.requireNonNull(prompt, "prompt");
         readOnlyPaths = new HashSet<>(readOnlyPaths);
         if (context.sourceFilename() != null) readOnlyPaths.add(context.sourceFilename());
-        List<Operation> operations = requestOperations(value, readOnlyPaths, history, files, context, arguments);
-        byte[] published = applyOperations(operations,
-                // Discovery never changes the original write authorization.
-                allowedFilePaths, readOnlyPaths);
+        byte[] published = requestOperations(value, readOnlyPaths, history, files, context,
+                arguments, allowedFilePaths);
         if (history != null) {
             try {
                 if (published.length > 0) history.output(published);
@@ -172,14 +187,20 @@ public class AICommandApplication implements AutoCloseable {
         }
     }
 
-    private List<Operation> requestOperations(String prompt, Set<String> readOnlyPaths,
+    private byte[] requestOperations(String prompt, Set<String> readOnlyPaths,
             ConversationHistory history, List<ContextFile> files, RequestContext context,
-            List<String> arguments) throws IOException {
+            List<String> arguments, java.util.function.Predicate<String> allowedFilePaths) throws IOException {
         String notice = null;
+        PreparedPrompt retained = preparedPrompt;
+        int patchRetries = 0;
+        int workflowRetries = 0;
+        boolean applying = false;
         boolean contextCommitted = false;
         provider.initialize();
         try {
-            for (int followUps = 0; ; followUps++) {
+            provider.setActivityListener(ProviderActivity.publisher(stdout, history));
+            int followUps = 0;
+            while (true) {
                 log("prompt.txt", prompt);
                 if (history != null) history.sent();
                 if (notice != null) {
@@ -194,11 +215,60 @@ public class AICommandApplication implements AutoCloseable {
                 if (history != null) history.received();
                 List<Operation> operations = parseOperations(response);
                 boolean control = operations.stream().anyMatch(op ->
-                        op.type == OperationType.LIST_FILES || op.type == OperationType.CHANGE_CONTEXTS);
-                if (!control) return operations;
+                        op.type == OperationType.LIST_FILES
+                                || (op.type == OperationType.CHANGE_CONTEXTS && ChangeContexts.followUp(op)));
+                if (!control) {
+                    try {
+                        applying = true;
+                        return applyOperations(operations, allowedFilePaths, readOnlyPaths, history, context);
+                    } catch (PatchValidationException failure) {
+                        applying = false;
+                        boolean again = automaticRetry && patchRetries < 3
+                                && retained != null;
+                        String report = failure.getMessage() + " "
+                                + (again ? "Requesting a corrected response; patch retry " + (patchRetries + 1) + "/3."
+                                : "No automatic patch retry: disabled, exhausted, or no CIOP envelope.");
+                        if (history != null) history.patchRejected(report);
+                        if (!again) throw failure;
+                        patchRetries++;
+                        notice = report;
+                        String feedback = report + "\nReturn a complete corrected batch for the retained request. "
+                                + "None of the rejected batch was applied. Earlier context changes remain committed. "
+                                + "Correct the patch against the supplied source; request updated context if needed.";
+                        prompt = retained.render("__ciop__/PATCH_FAILURE.txt", feedback);
+                        continue;
+                    } catch (WorkflowConflictException failure) {
+                        applying = false;
+                        boolean again = automaticRetry && workflowRetries < 2 && retained != null;
+                        String report = "# workflow: " + failure.getMessage() + " "
+                                + (again ? "Requesting fresh context; workflow retry " + (workflowRetries + 1) + "/2."
+                                : "No automatic workflow retry: disabled, exhausted, or no structured request. "
+                                        + "Inspect ai --workflow-status before submitting a new request.");
+                        if (history != null) history.executionEvent("workflow_rejected", report);
+                        if (!again) throw new WorkflowConflictException(report, failure);
+                        workflowRetries++;
+                        notice = report;
+                        context = workflow.store.context();
+                        files = new ArrayList<>(context.merge(new WorkingDirectoryPaths(workingDirectory), arguments));
+                        for (int i = 0; i < files.size(); i++) {
+                            ContextFile file = files.get(i);
+                            if (history != null && history.protects(resolve(file.path())))
+                                file = file.withAccess(FileAccess.READ);
+                            files.set(i, file);
+                            if (file.access() == FileAccess.READ) readOnlyPaths.add(file.path());
+                        }
+                        buildPrompt(retained.input(), files, context);
+                        retained = preparedPrompt;
+                        prompt = retained.render("__ciop__/WORKFLOW_FAILURE.txt", report
+                                + "\nReturn a complete new batch using the refreshed workflow. "
+                                + "Earlier context operations remain committed; do not repeat them.");
+                        continue;
+                    }
+                }
                 if (operations.size() != 1)
                     throw new IllegalArgumentException("list_files or change_contexts must be the only operation; no batch operations were applied");
                 if (followUps >= 5) throw new IllegalArgumentException("Control follow-up limit exceeded (5)");
+                followUps++;
                 Operation operation = operations.get(0);
                 String input;
                 if (operation.type == OperationType.LIST_FILES) {
@@ -227,12 +297,26 @@ public class AICommandApplication implements AutoCloseable {
                             + result.report();
                     notice = result.report() + "Sending the updated context back to the LLM.";
                 }
+                if (context.store != null) {
+                    context = context.store.context();
+                    files = new ArrayList<>(context.merge(new WorkingDirectoryPaths(workingDirectory), arguments));
+                    for (int i = 0; i < files.size(); i++) {
+                        ContextFile file = files.get(i);
+                        if (history != null && history.protects(resolve(file.path())))
+                            file = file.withAccess(FileAccess.READ);
+                        files.set(i, file);
+                        if (file.access() == FileAccess.READ) readOnlyPaths.add(file.path());
+                    }
+                }
                 prompt = buildPrompt(input.getBytes(StandardCharsets.UTF_8), files, context);
+                retained = preparedPrompt;
             }
         } catch (IOException | RuntimeException failure) {
-            if (contextCommitted)
+            if (contextCommitted && !applying)
                 throw new ContextCommittedException(failure);
             throw failure;
+        } finally {
+            provider.setActivityListener(ProviderActivity.Listener.NONE);
         }
     }
 
@@ -246,18 +330,22 @@ public class AICommandApplication implements AutoCloseable {
         try {
             writeTmpLog(suffix, text.getBytes(StandardCharsets.UTF_8));
         } catch (IOException exception) {
-            System.err.println("Warning: could not write /tmp " + suffix + " log:");
+            System.err.println(StatusColour.format("Warning: could not write /tmp " + suffix + " log:"));
             exception.printStackTrace(System.err);
         }
     }
 
     private String buildPrompt(byte[] stdin, List<ContextFile> files, RequestContext context) throws IOException {
+        workflow = WorkflowSession.capture(workingDirectory, context, files);
         StringBuilder result = new StringBuilder(BEGIN).append('\n');
         result.append(section("FILE", ProtocolDocument.bytes(),
                 "access=READ path=" + ProtocolDocument.PATH));
         if (context.hasPermissions())
             result.append(section("FILE", context.permissionsDocument().toString().getBytes(StandardCharsets.UTF_8),
                     "access=READ path=" + RequestContext.PERMISSIONS_PATH));
+        if (workflow != null)
+            result.append(section("FILE", workflow.promptDocument(),
+                    "access=READ path=" + WorkflowSession.DOCUMENT_PATH));
         for (ContextFile entry : files) {
             if (!entry.selection().isWhole()) {
                 result.append(SubsetEnvelope.read(new WorkingDirectoryPaths(workingDirectory), entry).section(entry));
@@ -271,11 +359,14 @@ public class AICommandApplication implements AutoCloseable {
                         .append(' ').append(metadata).append("---\n\n")
                         .append(END_SECTION).append('\n');
             } else {
-                result.append(section("FILE", WorkingDirectoryPaths.read(file), metadata));
+                result.append(section("FILE", workflow != null && workflow.matches(file)
+                        ? workflow.store.bytes() : WorkingDirectoryPaths.read(file), metadata));
             }
         }
-        result.append(section("STDIN", stdin, null));
-        return result.append(END).append('\n').toString();
+        if (originalInput != null && !java.util.Arrays.equals(originalInput, stdin))
+            result.append(section("FILE", originalInput, "access=READ path=__ciop__/ORIGINAL_REQUEST.txt"));
+        preparedPrompt = new PreparedPrompt(result.toString(), stdin.clone());
+        return preparedPrompt.render(null, null);
     }
 
     private static String section(String source, byte[] bytes, String metadata) {
@@ -288,11 +379,26 @@ public class AICommandApplication implements AutoCloseable {
     }
 
     private byte[] applyOperations(List<Operation> operations, java.util.function.Predicate<String> allowedPaths,
-            Set<String> readOnlyPaths) throws IOException {
+            Set<String> readOnlyPaths, ConversationHistory history, RequestContext context) throws IOException {
+        ConfigurationStore store = context.store;
+        if (store != null) store.beginBatch();
+        try {
+            return applyBatch(operations, allowedPaths, readOnlyPaths, history,
+                    store == null ? context : store.context());
+        } finally {
+            if (store != null) store.endBatch();
+        }
+    }
+
+    private byte[] applyBatch(List<Operation> operations, java.util.function.Predicate<String> allowedPaths,
+            Set<String> readOnlyPaths, ConversationHistory history, RequestContext context) throws IOException {
         java.util.Map<Path, byte[]> originals = new java.util.LinkedHashMap<>();
         java.util.Map<Path, byte[]> staged = new java.util.LinkedHashMap<>();
         java.util.Map<Path, Object> identities = new java.util.LinkedHashMap<>();
         java.io.ByteArrayOutputStream output = new java.io.ByteArrayOutputStream();
+        Workflow.Result workflowResult = null;
+        Path workflowTarget = null;
+        ChangeContexts.Plan contextPlan = null;
         for (int index = 0; index < operations.size(); index++) {
             Operation operation = operations.get(index);
             try {
@@ -300,30 +406,109 @@ public class AICommandApplication implements AutoCloseable {
                     output.writeBytes(operation.decode());
                     continue;
                 }
+                if (operation.type == OperationType.CHANGE_CONTEXTS) {
+                    if (workflow == null || contextPlan != null || index != operations.size() - 1
+                            || ChangeContexts.followUp(operation))
+                        throw new IllegalArgumentException("One follow_up:false change_contexts may appear last in a configured batch");
+                    contextPlan = ChangeContexts.plan(workingDirectory, context, List.of(),
+                            operation.data);
+                    continue;
+                }
+                if (operation.type == OperationType.WORKFLOW_UPDATE) {
+                    if (workflow == null || workflowResult != null)
+                        throw new IllegalArgumentException("workflow_update requires enabled tracking and at most one update per batch");
+                    workflowResult = workflow.update(StrictJson.parse(operation.data).getAsJsonObject());
+                    if (workflowResult.archived() && (history == null || !history.isEnabled()))
+                        throw new IllegalArgumentException("Archival requires enabled conversation history");
+                    workflow.verify();
+                    continue;
+                }
                 requireAllowed(operation.path, allowedPaths, operation.type.opcode());
                 Path target = resolve(operation.path);
                 requireWritable(target, readOnlyPaths);
                 prepareDestination(target, originals, identities);
                 byte[] source = staged.containsKey(target) ? staged.get(target) : originals.get(target);
-                staged.put(target, calculateOperation(operation, source));
+                try {
+                    staged.put(target, calculateOperation(operation, source));
+                } catch (IllegalArgumentException failure) {
+                    if (operation.type == OperationType.FILE_PATCH || operation.type == OperationType.FILE_PATCH_BINARY)
+                        throw new PatchValidationException(failure.getMessage(), failure);
+                    throw failure;
+                }
             } catch (IOException | RuntimeException exception) {
                 String message = "Operation " + (index + 1) + "/" + operations.size()
                         + " (" + operation.type.opcode()
                         + (operation.path == null ? "" : ", path=" + quote(operation.path))
                         + ") rejected: " + exception.getMessage()
                         + ". Batch validation failed; no destination files or stdout were changed.";
+                if (exception instanceof PatchValidationException)
+                    throw new PatchValidationException(message, exception);
+                if (exception instanceof WorkflowConflictException)
+                    throw new WorkflowConflictException(message, exception);
                 if (exception instanceof IOException) throw new IOException(message, exception);
                 throw new IllegalArgumentException(message, exception);
             }
         }
-        commitBatch(staged, originals, identities, readOnlyPaths);
+        boolean workflowChanged = workflowResult != null && !workflowResult.graph().equals(workflow.graph);
+        boolean contextChanged = contextPlan != null && contextPlan.changed(context);
+        if (workflowResult != null || contextPlan != null) {
+            if (workflowResult != null) workflow.verify();
+            byte[] replacement = workflow.store.replacement(
+                    workflowResult == null ? null : workflowResult.graph(),
+                    contextPlan == null ? null : contextPlan.selections());
+            if (contextPlan != null) {
+                for (ContextFile file : contextPlan.validationInputs()) {
+                    Path target = resolve(file.path());
+                    if (target.equals(workflow.target)) ChangeContexts.validateBytes(file, replacement);
+                    else if (staged.containsKey(target)) ChangeContexts.validateBytes(file, staged.get(target));
+                    else ChangeContexts.validateInput(new WorkingDirectoryPaths(workingDirectory), file);
+                }
+            }
+            if (workflowChanged || contextChanged) {
+                workflowTarget = workflow.target;
+                prepareDestination(workflowTarget, originals, identities);
+                staged.put(workflowTarget, replacement);
+            }
+        }
+        if (workflowChanged && history != null)
+            history.workflowEvent("workflow_prepared", workflow.record(workflowResult));
+        if (workflowResult != null) workflow.verify();
+        commitBatch(staged, originals, identities, readOnlyPaths, workflowTarget);
+        if (workflowTarget != null) workflow.store.accept(staged.get(workflowTarget));
+        if (workflowChanged || contextChanged) {
+            try {
+                if (workflowChanged && history != null)
+                    history.workflowEvent("workflow_committed", workflow.record(workflowResult));
+                if (contextChanged && history != null) history.contextsChanged(contextPlan.historyReport());
+                var notice = new java.io.ByteArrayOutputStream();
+                if (workflowChanged)
+                    notice.writeBytes(("\u001b[32;4m" + workflowResult.report() + "\u001b[0m\n")
+                            .getBytes(StandardCharsets.UTF_8));
+                if (contextChanged)
+                    notice.writeBytes(("\u001b[32;4m" + contextPlan.notice() + "\u001b[0m\n")
+                            .getBytes(StandardCharsets.UTF_8));
+                publishOutput(notice);
+            } catch (IOException | RuntimeException failure) {
+                throw new IOException("Files and configuration committed; history or notice publication failed. Do not retry the batch automatically.", failure);
+            }
+        }
+        try {
+            if (context.store != null) context.store.finishBatch();
+        } catch (IOException | RuntimeException failure) {
+            throw new IOException("Files committed; deferred history registration failed. Do not retry the batch automatically.", failure);
+        }
         return publishOutput(output);
+    }
+
+    /** Only patch calculation failures, before any commit, may request model correction. */
+    private static final class PatchValidationException extends IllegalArgumentException {
+        PatchValidationException(String message, Throwable cause) { super(message, cause); }
     }
 
     private byte[] calculateOperation(Operation operation, byte[] source) {
         return switch (operation.type) {
             case STDOUT, FILE_WRITE -> operation.decode();
-            case LIST_FILES, CHANGE_CONTEXTS -> throw new IllegalArgumentException("Control operations must be handled before batch application");
+            case LIST_FILES, CHANGE_CONTEXTS, WORKFLOW_UPDATE -> throw new IllegalArgumentException("Control operations must be handled before batch application");
             case FILE_DELETE -> null;
             case FILE_PATCH, FILE_PATCH_BINARY -> {
                 if (source == null)
@@ -359,17 +544,17 @@ public class AICommandApplication implements AutoCloseable {
 
     private void commitBatch(java.util.Map<Path, byte[]> staged,
             java.util.Map<Path, byte[]> originals,
-            java.util.Map<Path, Object> identities, Set<String> readOnlyPaths) throws IOException {
+            java.util.Map<Path, Object> identities, Set<String> readOnlyPaths, Path workflowTarget) throws IOException {
         // Recheck the entire snapshot before the first filesystem mutation.
         for (Path target : staged.keySet()) {
-            requireWritable(target, readOnlyPaths);
+            requireCommitWritable(target, readOnlyPaths, workflowTarget);
             checkSnapshot(target, originals.get(target), identities.get(target));
         }
         List<Path> attempted = new ArrayList<>();
         List<Path> directories = new ArrayList<>();
         try {
             for (Path target : staged.keySet()) {
-                requireWritable(target, readOnlyPaths);
+                requireCommitWritable(target, readOnlyPaths, workflowTarget);
                 checkSnapshot(target, originals.get(target), identities.get(target));
                 if (staged.get(target) != null)
                     createBatchDirectories(target.getParent(), directories);
@@ -401,6 +586,12 @@ public class AICommandApplication implements AutoCloseable {
             recoveryFailures.forEach(exception::addSuppressed);
             throw exception;
         }
+    }
+
+    private void requireCommitWritable(Path target, Set<String> readOnlyPaths, Path workflowTarget) throws IOException {
+        if (target.equals(workflowTarget)) {
+            WorkingDirectoryPaths.rejectReserved(workingDirectory, resolve(relative(target)));
+        } else requireWritable(target, readOnlyPaths);
     }
 
     private byte[] publishOutput(java.io.ByteArrayOutputStream output) throws IOException {
@@ -636,6 +827,7 @@ public class AICommandApplication implements AutoCloseable {
             operations.add(switch (type) {
                 case LIST_FILES -> listingOperation(object);
                 case CHANGE_CONTEXTS -> ChangeContexts.operation(object);
+                case WORKFLOW_UPDATE -> new Operation(type, null, "utf-8", object.toString(), null, null);
                 case FILE_DELETE -> Operation.deletion(requiredString(object, "path"));
                 case FILE_PATCH_BINARY -> new Operation(requiredString(object, "path"), object);
                 case FILE_PATCH -> Operation.textPatch(parsePatch(object));

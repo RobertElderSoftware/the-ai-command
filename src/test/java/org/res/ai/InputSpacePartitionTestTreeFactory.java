@@ -88,7 +88,9 @@ public final class InputSpacePartitionTestTreeFactory {
                 fixtureLeaf("list_files", (context, execution) ->
                         AvailableFilesTest.followUp(context.resolve("."))),
                 fixtureLeaf("change_contexts", (context, execution) ->
-                        ChangeContextsTest.followUp(context.resolve(".")))));
+                        ChangeContextsTest.followUp(context.resolve("."))),
+                fixtureLeaf("workflow_update", (context, execution) ->
+                        new WorkflowTest().mixedBatchPreservesPolicyAndPrintsNotice(context.resolve(".")))));
 
         PathCheck input = (context, fixture, path) ->
                 context.assertInputRejected(fixture.workingDirectory(), path);

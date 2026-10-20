@@ -7,7 +7,7 @@ import java.nio.charset.StandardCharsets;
 
 /** Stateless builders; preserve explicit invalid values and ordered duplicate context entries. */
 public final class TestJson {
-    private static final Gson JSON = new Gson();
+    private static final Gson JSON = new com.google.gson.GsonBuilder().serializeNulls().create();
     private TestJson() { }
 
     public static JsonObject object(Object... fields) {

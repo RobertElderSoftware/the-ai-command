@@ -28,7 +28,7 @@ import java.util.UUID;
  */
 public final class ConversationHistory {
     public static final String DIRECTORY = "conversation_history";
-    private static final Gson CONTEXT_JSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
+    private static final Gson CONTEXT_JSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().serializeNulls().create();
     private static final Object APPEND_LOCK = new Object();
     private final Path directory;
     private final WorkingDirectoryPaths paths;
@@ -37,10 +37,19 @@ public final class ConversationHistory {
     private final boolean enabled;
     private final boolean registerContext;
     private boolean contextSelectionChanged;
+    private ConfigurationStore configuration;
+
+    void useConfiguration(ConfigurationStore store) { configuration = store; }
+
+    RequestContext configuration() throws IOException {
+        if (configuration == null) configuration = new ConfigurationStore(directory, contextFilename);
+        return configuration.context();
+    }
 
     public void contextsChanged(String report) throws IOException {
         // Do not immediately re-add a history file explicitly removed this invocation.
         contextSelectionChanged = true;
+        if (configuration != null) configuration.suppressHistory();
         append("contexts_changed", report.getBytes(StandardCharsets.UTF_8));
     }
     private final String requestId = UUID.randomUUID().toString();
@@ -82,6 +91,17 @@ public final class ConversationHistory {
 
     public String contextFilename() { return contextFilename; }
 
+    boolean isEnabled() { return enabled; }
+
+    /** Record already-formatted execution observations without terminal ANSI. */
+    void executionEvent(String event, String report) throws IOException {
+        append(event, report.getBytes(StandardCharsets.UTF_8));
+    }
+
+    void workflowEvent(String event, JsonObject record) throws IOException {
+        append(event, WorkflowHistoryFormat.format(event, record).getBytes(StandardCharsets.UTF_8));
+    }
+
     public boolean protects(Path file) throws IOException {
         return file.startsWith(paths.resolve(DIRECTORY))
                 || WorkingDirectoryPaths.sameFile(file, paths.resolve(contextFilename));
@@ -92,6 +112,10 @@ public final class ConversationHistory {
     public void received() throws IOException { append("response_received", null); }
     public void output(byte[] bytes) throws IOException { append("stdout", bytes); }
     public void applied() throws IOException { append("applied", null); }
+
+    void patchRejected(String report) throws IOException {
+        append("patch_rejected", report.getBytes(StandardCharsets.UTF_8));
+    }
 
     public void failed(Throwable failure) throws IOException {
         ProviderLimitException limit = FailureReporting.limit(failure);
@@ -147,27 +171,12 @@ public final class ConversationHistory {
     /** Reconcile even existing files, including a prior crash before registration. */
     private void register(String filename) throws IOException {
         if (!registerContext || contextSelectionChanged) return;
-        Path config = paths.contextFile(new ContextFile(contextFilename, FileAccess.READ_WRITE));
-        byte[] original = Files.notExists(config, LinkOption.NOFOLLOW_LINKS)
-                ? null : WorkingDirectoryPaths.read(config);
-        if (original == null) return; // History never creates a context configuration.
-        RequestContext context = RequestContext.load(directory, contextFilename);
-        JsonObject document = context.withHistory(paths, filename);
-        if (document.equals(com.google.gson.JsonParser.parseString(
-                new String(original, StandardCharsets.UTF_8)))) return;
-        replaceContext(config, original,
-                (CONTEXT_JSON.toJson(document) + "\n").getBytes(StandardCharsets.UTF_8));
-    }
-
-    private void replaceContext(Path config, byte[] original, byte[] replacement) throws IOException {
-        paths.contextFile(new ContextFile(contextFilename, FileAccess.READ));
-        AtomicFileReplacement.replace(config, replacement, ".ciop-history-", true, () -> {
-            paths.contextFile(new ContextFile(contextFilename, FileAccess.READ_WRITE));
-            byte[] current = Files.notExists(config, LinkOption.NOFOLLOW_LINKS)
-                    ? null : WorkingDirectoryPaths.read(config);
-            if (!Arrays.equals(original, current))
-                throw new IOException("Context changed while registering conversation history: " + contextFilename);
-        });
+        if (configuration == null) {
+            Path config = paths.contextFile(new ContextFile(contextFilename, FileAccess.READ_WRITE));
+            if (Files.notExists(config, LinkOption.NOFOLLOW_LINKS)) return;
+            configuration = new ConfigurationStore(directory, contextFilename);
+        }
+        configuration.registerHistory(filename);
     }
 
     private static void write(FileChannel channel, byte[] bytes) throws IOException {

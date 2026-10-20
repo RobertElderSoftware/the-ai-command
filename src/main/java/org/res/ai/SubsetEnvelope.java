@@ -31,9 +31,24 @@ final class SubsetEnvelope {
     }
 
     static Result read(WorkingDirectoryPaths paths, ContextFile file) throws IOException {
-        ContextSelection selection = file.selection();
-        if (selection.isWhole()) throw new IllegalArgumentException("Subset required: " + file.path());
+        if (file.selection().isWhole()) throw new IllegalArgumentException("Subset required: " + file.path());
         Path source = paths.contextFile(file);
+        return read(file, Files.newInputStream(source, LinkOption.NOFOLLOW_LINKS));
+    }
+
+    static Result read(ContextFile file, byte[] bytes) throws IOException {
+        if (file.selection().isWhole()) throw new IllegalArgumentException("Subset required: " + file.path());
+        return read(file, new java.io.ByteArrayInputStream(bytes));
+    }
+
+    private static Result read(ContextFile file, java.io.InputStream source) throws IOException {
+        try (source) {
+            return extract(file, source);
+        }
+    }
+
+    private static Result extract(ContextFile file, java.io.InputStream source) throws IOException {
+        ContextSelection selection = file.selection();
         MessageDigest digest;
         try {
             digest = MessageDigest.getInstance("SHA-256");
@@ -49,7 +64,7 @@ final class SubsetEnvelope {
         long lineCount = 0;
         int rangeIndex = 0;
         byte[] block = new byte[8192];
-        try (var input = Files.newInputStream(source, LinkOption.NOFOLLOW_LINKS)) {
+        try (var input = source) {
             int count;
             while ((count = input.read(block)) != -1) {
                 digest.update(block, 0, count);

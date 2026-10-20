@@ -25,6 +25,10 @@ public final class RequestContext {
     private final List<Rule> rules;
     private final boolean configured;
     private String sourceFilename;
+    private JsonObject workflow;
+    ConfigurationStore store;
+
+    JsonObject workflow() { return workflow == null ? null : workflow.deepCopy(); }
 
     String sourceFilename() { return sourceFilename; }
 
@@ -45,6 +49,8 @@ public final class RequestContext {
 
         RequestContext result = new RequestContext(selected, rules, configured);
         result.sourceFilename = sourceFilename;
+        result.workflow = workflow();
+        result.store = store;
         result.merge(paths, List.of());
         return result;
     }
@@ -56,6 +62,8 @@ public final class RequestContext {
             selected.add(entry.withAccess(requireRead(paths, entry.path())));
         RequestContext result = new RequestContext(selected, rules, configured);
         result.sourceFilename = sourceFilename;
+        result.workflow = workflow();
+        result.store = store;
         result.merge(paths, List.of());
         return result;
     }
@@ -102,10 +110,22 @@ public final class RequestContext {
     }
 
     public static RequestContext load(Path directory, String filename) throws IOException {
+        return new ConfigurationStore(directory, filename).context();
+    }
+
+    static RequestContext parse(Path directory, String filename, byte[] bytes) throws IOException {
         WorkingDirectoryPaths paths = new WorkingDirectoryPaths(directory);
-        Path config = paths.contextFile(new ContextFile(filename, FileAccess.READ));
-        String json = Encoding.strictUtf8(WorkingDirectoryPaths.read(config));
+        String json = Encoding.strictUtf8(bytes);
         if (json == null) throw new IllegalArgumentException("Context is not UTF-8: " + filename);
+        JsonObject graph;
+        try {
+            JsonObject document = StrictJson.parse(json).getAsJsonObject();
+            ConfigurationStore.counter(document, "revision", true);
+            graph = document.has("workflow") ? Workflow.validate(document.get("workflow")) : null;
+        } catch (com.google.gson.JsonParseException | IllegalStateException | IllegalArgumentException exception) {
+            throw new IllegalArgumentException("Invalid context " + filename + ": "
+                    + exception.getMessage(), exception);
+        }
         List<ContextFile> selections = new ArrayList<>();
         List<Rule> rules = new ArrayList<>();
         Set<String> fields = new HashSet<>();
@@ -143,12 +163,13 @@ public final class RequestContext {
                         }
                         reader.endArray();
                     }
+                    case "workflow", "revision" -> reader.skipValue();
                     default -> throw new IllegalArgumentException("Unknown context field: " + field
                             + "; expected contexts and permissions");
                 }
             }
             reader.endObject();
-            if (!fields.equals(Set.of("contexts", "permissions")))
+            if (!fields.containsAll(Set.of("contexts", "permissions")))
                 throw new IllegalArgumentException("Both contexts and permissions arrays are required");
             if (reader.peek() != JsonToken.END_DOCUMENT)
                 throw new IllegalArgumentException("Unexpected content after context object");
@@ -162,6 +183,7 @@ public final class RequestContext {
             entries.add(entry.withAccess(policy.requireRead(paths, entry.path())));
         RequestContext result = new RequestContext(entries, rules, true);
         result.sourceFilename = filename;
+        result.workflow = graph;
         result.merge(paths, List.of());
         return result;
     }
@@ -221,6 +243,7 @@ public final class RequestContext {
         rules.forEach(rule -> permissions.add(rule.json()));
         JsonObject result = new JsonObject();
         result.add("contexts", contexts);
+        if (workflow != null) result.add("workflow", workflow.deepCopy());
         result.add("permissions", permissions);
         return result;
     }

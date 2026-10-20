@@ -137,7 +137,7 @@ final class ProviderRetry {
                             + (remaining % 1_000_000_000L == 0 ? 0 : 1);
                     String countdown = String.format(java.util.Locale.ROOT, "%02d:%02d:%02d",
                             seconds / 3600, seconds / 60 % 60, seconds % 60);
-                    String message = backend + " retry " + attempt + " | now " + time(clock.instant())
+                    String message = backend + " waiting for usage limit reset | retry " + attempt + " | now " + time(clock.instant())
                             + " | retry at " + time(retryAt) + " (includes 5s buffer) | remaining "
                             + (terminal ? "\u001b[33m" : "") + countdown
                             + (terminal ? "\u001b[0m" : "") + " | Ctrl+C to exit";
@@ -173,8 +173,8 @@ final class ProviderRetry {
             throw new InterruptedIOException("Provider retry cancelled");
     }
 
-    private static void write(OutputStream output, String value) throws IOException {
-        output.write(value.getBytes(StandardCharsets.UTF_8));
+    private void write(OutputStream output, String value) throws IOException {
+        output.write(StatusColour.format(value, terminal).getBytes(StandardCharsets.UTF_8));
         output.flush();
         if (output instanceof PrintStream stream && stream.checkError())
             throw new IOException("Could not publish provider retry status");

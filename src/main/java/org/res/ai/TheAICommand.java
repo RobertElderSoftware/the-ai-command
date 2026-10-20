@@ -20,8 +20,9 @@ public final class TheAICommand {
 
     private static Map<String, String> descriptions() {
         Map<String, String> descriptions = new LinkedHashMap<>();
+        descriptions.put("--workflow-status", "Print the saved workflow without reading stdin or contacting a provider.");
         descriptions.put("--help", "Print this help and exit without reading stdin or contacting an LLM.");
-        descriptions.put("--no-auto-retry", "Disable both network recovery waiting and provider-limit waiting.");
+        descriptions.put("--no-auto-retry", "Disable network recovery, provider-limit waiting, patch correction, and workflow revision retries.");
         descriptions.put("--enable-conversation-history", "Enable history recording, creating the conversation_history directory if missing.");
         descriptions.put("--disable-conversation-history", "Disable conversation history recording and registration.");
         descriptions.put("--ignore-context", "Ignore the default or explicitly selected context file, including history registration.");
@@ -46,6 +47,13 @@ public final class TheAICommand {
                 return 0;
             }
             Path directory = Path.of(".");
+            if (options.containsKey("--workflow-status")) {
+                if (options.containsKey("--ignore-context"))
+                    throw new IllegalArgumentException("--workflow-status requires a context configuration");
+                RequestContext context = RequestContext.load(directory, options.get("--context"));
+                System.out.print(Workflow.render(WorkflowSession.effectiveGraph(context.workflow())));
+                return 0;
+            }
             byte[] stdin = System.in.readAllBytes();
             String backend = options.get("--backend").toLowerCase(Locale.ROOT);
             LLMProvider provider = switch (backend) {
@@ -75,7 +83,8 @@ public final class TheAICommand {
         System.out.println("Exit codes: 0 success; 1 general failure; 3 provider limit; 4 network failure or uncertain submission.");
         System.out.println("Provider calls automatically retry after a known future reset plus a five-second buffer.");
         System.out.println("Ctrl+C exits while waiting. Coloured ANSI countdowns refresh every second, including with piped stdin. Use -Dai.retry.ansi=false for plain transition notices when redirecting output.");
-        System.out.println("Only the exact failed provider prompt is resent; committed context operations are not repeated.");
+        System.out.println("Transport retries resend the exact prompt; committed context operations are not repeated.");
+        System.out.println("Patch calculation failures allow up to 3 corrected responses with diagnostic feedback; --no-auto-retry disables them.");
         System.out.println("Unknown, incomplete, stale, or time-only reset information exits with code 3; billing quotas are not retried.");
         System.out.println("Codex reset lookup uses a three-second App Server query by default; -Dai.codex.rateLimitLookup=false disables it.");
         System.out.println("Use -Dai.codex.limitId=codex to select the metered bucket. OpenAI SDK retries are disabled; this application owns retry scheduling.");

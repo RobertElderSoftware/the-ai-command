@@ -100,7 +100,7 @@ ai [options] [--] [files...]
 | `--ignore-context` | Ignore the context configuration, including its creation and history registration. |
 | `--enable-conversation-history` | Enable history and create its directory if missing. |
 | `--disable-conversation-history` | Disable history recording and registration. |
-| `--no-auto-retry` | Disable automatic network recovery and provider-limit waits. |
+| `--no-auto-retry` | Disable network recovery, provider-limit waits, patch corrections, and workflow revision retries. |
 | `--` | Treat all remaining arguments as file paths. |
 
 Value options accept either `--name value` or `--name=value`; the last supplied value wins. The history enable and disable flags cannot be combined.
@@ -174,7 +174,11 @@ The model can request file discovery or change the configured context selection.
 
 ## Network recovery and provider limits
 
-Automatic retries are enabled by default. Only the retained provider prompt is retried; already-committed context changes and file operations are not replayed.
+Automatic retries are enabled by default. Transport recovery retries the retained provider prompt; already-committed context changes and file operations are not replayed.
+
+Patch calculation failures (including text mismatches, stale hashes, bounds errors, and result-hash mismatches) permit up to three correction requests per invocation. Each rejection records the operation, path, and specific diagnostic in a readable `patch_rejected` history event when recording is enabled. Before retrying, a green underlined notice explains the rejection and retry number. The retained CIOP prompt is sent with a read-only diagnostic document so the model can return a complete corrected batch. Source context is retained; the model can request updated context when necessary.
+
+The rejected batch has made no destination changes or published model stdout. Prior context changes remain committed, permissions and READ protections are retained, and control follow-up counts are not reset. `--no-auto-retry` disables patch retries. Permission, parsing, configuration, commit, history, and output failures do not trigger this correction loop. Automatic correction requires the structured request prepared by `run` or `runWithHistory`; the low-level `executePrompt(String, Set)` API remains single-attempt for application validation failures.
 
 Before submission, credential-free network checks test reachability. Each check has a default ten-second limit, including DNS. While offline, the application waits fifteen seconds between checks without submitting prompts or spending the resubmission budget. This wait can continue until connectivity returns or you press Ctrl+C.
 
@@ -258,3 +262,52 @@ See [specification.txt](specification.txt) for the full CIOP/1.1 envelope, opera
 ## Pull requests
 
 Do not make pull requests for this project. They will be ignored.
+
+## Persistent workflows
+
+Workflow tracking records tasks, owners, dependencies, decisions and current focus in the context configuration. It does not execute tasks automatically.
+
+Tracking is automatically available whenever a configuration is loaded from disk, including the default context.json and custom --context files. An absent workflow field represents an empty graph at revision 0; the first effective update persists it. No manual configuration edits are required. Missing configurations, --ignore-context, and programmatic contexts without a source file do not enable tracking.
+
+The model receives the complete graph in the read-only virtual document __ciop__/WORKFLOW.json, independently of context selections. You do not need to select or grant read permission to the configuration itself. Existing permissions and selections are preserved. The dedicated workflow_update operation changes only the workflow field; ordinary configuration writes remain prohibited. Requests with no effective workflow changes leave the configuration unchanged.
+
+Use `ai --workflow-status` or `ai --context custom.json --workflow-status` to see progress without sending a prompt or reading stdin. The model can update the graph alongside its file changes. Successful updates print short coloured notices, including status transitions.
+
+Configuration persistence assumes one application instance and no external edits during a request. One invocation-owned store handles history registration, context selections and workflow saves. An optional top-level `revision` defaults to zero and increments once per effective configuration transaction; combined workflow/context changes increment it once. Ordinary history appends and no-ops do not increment it. It is a nonnegative signed 64-bit integer; overflow rejects the change. `workflow.version` remains the schema number, while `workflow.revision` independently counts graph changes.
+
+Workflow validity depends on the graph revision supplied to the model, not the whole configuration revision. History additions during generation are preserved without a retry. During batch preparation and commit, history events are still appended, while configuration registrations are queued until the batch ends. Explicit context changes retain their existing history-registration suppression. Store state advances only after successful persistence; rollback uses the latest saved configuration.
+
+A response with an incorrect workflow revision, or a graph revision that changed after prompt construction, rejects the entire uncommitted batch and permits at most two fresh-context requests per invocation. Readable `workflow_rejected` history and green `# workflow:` notices distinguish these causes and show expected/current revisions and retry counts. `--no-auto-retry` disables recovery. Original task input and current follow-up input are retained directly; patch retries reuse captured sections without searching envelope text. Patch, workflow and control budgets never reset one another. Earlier committed context operations are not replayed. Commit, rollback, permission, history, output and external-configuration failures never trigger this recovery.
+
+Completed components can be archived when no longer relevant. Archival requires enabled conversation history and includes done, skipped and cancelled nodes; any unfinished node prevents archival. Workflow notices and history lines use a # workflow: prefix. History records readable summaries and task changes instead of full JSON graphs. Preparation includes removed task details, completion notes and changed dependencies; the commit event confirms success using the same transaction ID. Failed commits retain preparation records without claiming success. Existing history entries are preserved.
+
+See specification.txt section 8 for the schema and action formats. Run `mvn clean verify` after applying implementation changes. New workflow tests cover interruptions, decisions, validation, mixed batches, rollback, concurrent edits, context preservation and archival.
+
+### Release context when work is finished
+
+The model can append a final context change to a file/workflow batch without requesting another model call:
+
+```json
+{"op":"change_contexts","add":[],"remove":["src/main/java/org/res/ai/ProviderRetry.java"],"follow_up":false}
+```
+
+This removes the file from future configured prompts while preserving its contents and permissions. Loaded conversation history and its existing excerpts are protected. An explicit command-line input may be removed from configured selections for future requests; it remains an input to the current request.
+
+Omitting `follow_up`, or setting it to `true`, retains the standalone operation and another model call. With `false`, one context operation must come last, can also add files or update excerpts for future requests, and does not consume the follow-up budget. Selections are validated against staged file contents, so a file can be created and selected in one batch. Configuration and workflow changes share one replacement and the file batch's rollback behavior. No-op cleanup leaves configuration bytes unchanged.
+
+Successful cleanup prints a coloured `# context:` notice and records readable history. The protocol asks the model to release files no longer needed after completing work, while retaining inputs for unfinished tasks. Savings begin with the next prompt. Rebuild the JAR with `mvn clean verify` before using the new flag.
+
+## Live Codex command activity
+
+Codex command events produce live blue underlined `# exec:` notices showing the provider-attempt identifier, item ID, command start, reported exit/status, and observed elapsed time. A missing start makes elapsed time unavailable; an unfinished item is reported as completion not observed. These observations remain visible if the final CIOP batch fails and are saved without ANSI in readable `execution_*` history events.
+
+Java properties (before `-jar`):
+
+- `ai.codex.exec.status=true`: enable activity notices and their history entries. Set false to disable both.
+- `ai.codex.exec.output=false`: optionally display completed command output, limited to 4096 escaped characters per item with a truncation label. Command summaries are limited to 512 escaped characters.
+- `ai.codex.exec.memory=false`: optionally recognize standalone `CIOP_MEMORY_FILE {"label":"frames","bytes":1024,"purpose":"render input"}` lines in completed command output. Reports are explicitly unverified; at most 16 markers in the first 65536 UTF-16 units are inspected per command.
+- `ai.retry.ansi=false`: also makes execution notices plain.
+
+Only Codex-reported command items are observed. This does not enumerate nested subprocesses or anonymous descriptors. Paths such as `/proc/self/fd/7` do not establish that a file is memory-backed. Marker data never causes paths or descriptors to be opened. Command text and optional output may contain sensitive data and, when history is enabled, become part of subsequent history context.
+
+The provider drains JSONL while writing stdin, preserves split UTF-8 records and the runner's final suffix, and rejects records larger than 16 MiB. Diagnostic stdout/stderr retain at most 64 KiB each; command tracking permits 10000 items per attempt. Reporting failures are local failures and never automatically resubmit the prompt. The sandbox command line is unchanged.
